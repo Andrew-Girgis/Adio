@@ -125,6 +125,13 @@ class StreamingAudioQueue {
 
 const issueInput = must(document.querySelector<HTMLInputElement>("#issueInput"), "issueInput");
 const modelInput = must(document.querySelector<HTMLInputElement>("#modelInput"), "modelInput");
+const modeSelect = must(document.querySelector<HTMLSelectElement>("#modeSelect"), "modeSelect");
+const youtubeUrlInput = must(document.querySelector<HTMLInputElement>("#youtubeUrlInput"), "youtubeUrlInput");
+const transcriptInput = must(document.querySelector<HTMLTextAreaElement>("#transcriptInput"), "transcriptInput");
+const transcriptFileInput = must(
+  document.querySelector<HTMLInputElement>("#transcriptFileInput"),
+  "transcriptFileInput"
+);
 const startSessionBtn = must(document.querySelector<HTMLButtonElement>("#startSessionBtn"), "startSessionBtn");
 const micBtn = must(document.querySelector<HTMLButtonElement>("#micBtn"), "micBtn");
 const micStatus = must(document.querySelector<HTMLSpanElement>("#micStatus"), "micStatus");
@@ -229,6 +236,18 @@ function handleServerMessage(message: ServerWsMessage): void {
 
     case "metrics":
       metricsOutput.textContent = JSON.stringify(message.payload, null, 2);
+      return;
+
+    case "rag.context":
+      metricsOutput.textContent = JSON.stringify(
+        {
+          ragSource: message.payload.source,
+          query: message.payload.query,
+          citations: message.payload.citations
+        },
+        null,
+        2
+      );
       return;
 
     case "error":
@@ -354,11 +373,16 @@ startSessionBtn.addEventListener("click", async () => {
   partialMessageNode = null;
   metricsOutput.textContent = "No stream metrics yet.";
 
+  const mode = (modeSelect.value === "youtube" ? "youtube" : "manual") as "manual" | "youtube";
+
   sendMessage({
     type: "session.start",
     payload: {
       issue: issueInput.value,
-      modelNumber: modelInput.value || undefined
+      modelNumber: modelInput.value || undefined,
+      mode,
+      youtubeUrl: youtubeUrlInput.value.trim() || undefined,
+      transcriptText: transcriptInput.value.trim() || undefined
     }
   });
 
@@ -429,3 +453,14 @@ commandGrid.querySelectorAll("button[data-command]").forEach((button) => {
 
 setupMic();
 setStatus("Ready. Start a session.");
+
+transcriptFileInput.addEventListener("change", async () => {
+  const file = transcriptFileInput.files?.[0];
+  if (!file) {
+    return;
+  }
+
+  const text = await file.text();
+  transcriptInput.value = text;
+  modeSelect.value = "youtube";
+});

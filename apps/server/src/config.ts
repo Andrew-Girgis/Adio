@@ -18,6 +18,13 @@ export interface AppConfig {
   smallestWsUrl: string;
   maxTtsRetries: number;
   sampleRate: number;
+  supabaseUrl?: string;
+  supabaseServiceRoleKey?: string;
+  supabaseAnonKey?: string;
+  embeddingsProvider: string;
+  embeddingsApiKey?: string;
+  embeddingsModel: string;
+  ragTopK: number;
   logLevel: "debug" | "info" | "warn" | "error";
 }
 
@@ -57,6 +64,13 @@ export function loadConfig(): AppConfig {
       process.env.SMALLEST_TTS_WS_URL ?? "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream",
     maxTtsRetries: Number(process.env.MAX_TTS_RETRIES ?? 2),
     sampleRate: Number(process.env.SMALLEST_SAMPLE_RATE ?? 24000),
+    supabaseUrl: process.env.SUPABASE_URL,
+    supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+    embeddingsProvider: process.env.EMBEDDINGS_PROVIDER ?? "openai",
+    embeddingsApiKey: process.env.EMBEDDINGS_API_KEY,
+    embeddingsModel: process.env.EMBEDDINGS_MODEL ?? "text-embedding-3-small",
+    ragTopK: Number(process.env.RAG_TOP_K ?? 4),
     logLevel: (process.env.LOG_LEVEL as AppConfig["logLevel"]) ?? "info"
   };
 }

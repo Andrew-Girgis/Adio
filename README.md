@@ -1,112 +1,108 @@
 # Adio
 
-Adio is a voice-first repair companion for home appliances and basic car fixes. It guides one procedural step at a time, requires confirmation before advancing, and supports real-time interruption commands (`stop`, `resume`, `repeat`, `skip`, `explain`, `safety check`).
+Adio is a voice-first repair companion for home appliances and basic car fixes. It executes one procedural step at a time with confirmation-gated progression and interruption commands (`stop`, `resume`, `repeat`, `skip`, `explain`, `safety check`).
 
-Built for the AI Agents Waterloo Voice Hackathon with deep smallest.ai Waves streaming TTS integration and a demo-mode fallback.
+Built for the AI Agents Waterloo Voice Hackathon with:
+- smallest.ai Waves streaming TTS
+- Supabase Postgres + pgvector RAG
+- YouTube Guide Mode (transcript -> compiled procedure)
 
-## Why This Is Voice-Native
-- Procedure engine with explicit state machine and confirmation gating.
-- Real-time command grammar designed for spoken interruptions.
-- Barge-in handling: user speech immediately stops active TTS stream.
-- Streaming transcript + streaming audio over WebSockets.
+## Core Modes
+- Manual RAG Mode: local/sample manuals or Supabase vector retrieval.
+- YouTube Guide Mode: YouTube URL + transcript paste/file compiles to deterministic steps with timestamp citations.
+
+## Why Supabase + pgvector
+- Supabase provides hosted Postgres for relational + vector data.
+- `pgvector` powers semantic manual retrieval with metadata filters (`domain`, `brand`, `model`).
+- Same backend can store optional session/procedure telemetry and YouTube compiled artifacts.
+- Demo reliability remains high: automatic fallback to local retrieval when Supabase is unavailable.
 
 ## Monorepo Layout
 ```
 .
 ├── apps
-│   ├── server      # Node/TS WebSocket orchestration + TTS bridge + debug endpoint
-│   └── web         # Single-page voice UI (mic, transcript, streamed audio playback)
+│   ├── server
+│   │   ├── src/rag      # Supabase retrieval + ingest
+│   │   └── src/youtube  # YouTube transcript compiler pipeline
+│   └── web
 ├── packages
-│   └── core        # Shared types, command grammar, retrieval stub, procedure engine
+│   └── core
 ├── data
 │   └── sample_manuals
-├── ARCHITECTURE.md
-├── PRODUCT_SPEC.md
-├── VOICE_UX.md
-├── EVAL.md
-├── RUNBOOK.md
-├── SECURITY.md
-└── CONTRIBUTING.md
+├── supabase
+│   └── sql
+└── docs/*.md (root markdown files)
 ```
 
 ## Quick Start
-### Prerequisites
-- Node.js 20+
-- pnpm 9+
-
-### Install
+### 1) Install
 ```bash
 pnpm i
-```
-
-### Configure
-```bash
 cp .env.example .env
 ```
 
-`DEMO_MODE=true` works out of the box with local manuals and synthetic tone streaming.
-
-To use smallest.ai Waves:
-1. Set `DEMO_MODE=false`
-2. Set `SMALLEST_API_KEY`
-3. Optionally set `SMALLEST_VOICE_ID`
-
-### Run
+### 2) Run demo mode (no Supabase required)
 ```bash
 pnpm dev
 ```
+- Web: `http://localhost:5173`
+- Server health: `http://localhost:8787/health`
+- Server debug: `http://localhost:8787/debug`
 
-- Web UI: `http://localhost:5173`
-- Server debug endpoint: `http://localhost:8787/debug`
-- Server health endpoint: `http://localhost:8787/health`
-
-## Demo Script (90 seconds)
-1. Open web UI and click **Start Voice Session** with issue: `Dishwasher is not draining`.
-2. Let Adio speak step 1.
-3. Say: `Stop` while Adio is speaking (barge-in).
-4. Say: `Resume` then `Explain`.
-5. Say: `Safety check`.
-6. Say: `Confirm` to advance.
-7. Say: `Skip` on a safety-critical step; hear safety warning.
-8. Say: `Skip confirm` to force skip.
-9. Continue with `Confirm` to completion.
-
-## Architecture (ASCII)
-```
-+-------------------+            WS (/ws)             +-------------------------+
-|   apps/web        | <--------------------------------> |   apps/server          |
-|-------------------|                                     |------------------------|
-| - Mic capture     |                                     | - Session orchestrator |
-| - Typed fallback  |                                     | - Procedure engine     |
-| - Transcript UI   |                                     | - Command parser       |
-| - Audio queue     |                                     | - Retrieval stub       |
-+---------+---------+                                     | - TTS bridge           |
-          |                                               +-----------+------------+
-          |                                                            |
-          |                                                            |
-          |                                              Primary: smallest.ai Waves
-          |                                              Fallback: demo tone stream
-          |
-          v
-+-------------------+
-| packages/core     |
-|-------------------|
-| shared types      |
-| command grammar   |
-| procedure engine  |
-| manual retrieval  |
-+-------------------+
+## Supabase Setup (Manual RAG + YouTube persistence)
+1. Create a Supabase project.
+2. Run SQL files in order:
+   - `supabase/sql/00_extensions.sql`
+   - `supabase/sql/01_manual_chunks.sql`
+   - `supabase/sql/02_match_manual_chunks.sql`
+   - `supabase/sql/03_video_guides.sql`
+3. Set `.env`:
+   - `SUPABASE_URL`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+   - `EMBEDDINGS_PROVIDER=openai`
+   - `EMBEDDINGS_API_KEY`
+4. Ingest manuals:
+```bash
+pnpm ingest:manuals
 ```
 
-## Voice Command Grammar
+If Supabase retrieval fails at runtime, server retries once and falls back to local keyword retrieval.
+
+## YouTube Guide Mode
+### User input options
+- YouTube URL + transcript paste/file (`.txt`, `.vtt`, `.srt`)
+- Transcript paste/file only (works fully offline)
+
+### Pipeline
+1. Normalize transcript (clean filler words, preserve timestamp ranges).
+2. Extract tools/materials and candidate action steps.
+3. Apply safety layer (electricity/gas/water/jack/pressure => high safety + confirmation).
+4. Compile deterministic `procedure_json` with timestamp citation per step.
+5. Execute compiled procedure through the existing stateful Procedure Engine.
+
+### Determinism policy
+- No hallucinated steps.
+- If actionable/timestamped data is missing, Adio asks clarifying questions and does not invent instructions.
+
+## Demo Script (YouTube Guide Mode)
+1. Switch mode to **YouTube Guide Mode**.
+2. Paste transcript text (or load `.vtt/.srt` file).
+3. Click **Start Voice Session**.
+4. Let Adio read step 1 with timestamp citation.
+5. Say `Stop`, then `Resume`.
+6. Say `Explain` and verify transcript-grounded expansion.
+7. Say `Safety check` on a high-risk step.
+8. Continue with `Confirm` until completion.
+
+## Voice Commands
 - `stop`
 - `resume`
 - `repeat`
 - `skip`
-- `skip confirm` (required for safety-critical skips)
+- `skip confirm`
 - `explain`
 - `safety check`
-- `confirm` (also accepts `done`, `next`, `yes`)
+- `confirm`
 
 ## Environment Variables
 | Variable | Required | Default | Purpose |
@@ -119,33 +115,30 @@ pnpm dev
 | `SMALLEST_VOICE_ID` | No | `emily` | smallest.ai voice |
 | `SMALLEST_TTS_WS_URL` | No | Waves stream URL | smallest.ai streaming endpoint |
 | `MAX_TTS_RETRIES` | No | `2` | reconnect retry count |
-| `VITE_SERVER_WS_URL` | No | `ws://localhost:8787/ws` | Frontend server WS target |
-
-## Streaming + Latency Observability
-- Structured JSON logs from server.
-- Stream metrics sent to web client:
-  - time-to-first-audio (TTFA)
-  - approx chars/sec proxy for throughput
-- Debug panel endpoint: `GET /debug`
+| `SUPABASE_URL` | No (recommended) | - | Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | No (recommended) | - | Server-only key for ingest + retrieval + youtube persistence |
+| `SUPABASE_ANON_KEY` | Optional | - | Optional future client-side use |
+| `EMBEDDINGS_PROVIDER` | No | `openai` | Embedding backend |
+| `EMBEDDINGS_API_KEY` | Required for Supabase RAG mode | - | Embedding generation key |
+| `EMBEDDINGS_MODEL` | No | `text-embedding-3-small` | Embedding model (1536 dims) |
+| `RAG_TOP_K` | No | `4` | Retrieved chunks per user turn |
+| `VITE_SERVER_WS_URL` | No | `ws://localhost:8787/ws` | Frontend WS target |
 
 ## Troubleshooting
-### Web says `Server not connected`
-- Verify backend is running on `8787`.
-- Confirm `VITE_SERVER_WS_URL` points to `/ws`.
+### YouTube mode asks for transcript instead of compiling
+- Transcript auto-retrieval is intentionally conservative for hackathon reliability.
+- Paste transcript text or upload `.txt/.vtt/.srt`.
+
+### `pnpm ingest:manuals` fails
+- Verify `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `EMBEDDINGS_API_KEY`.
+- Verify all SQL migrations ran in order.
+
+### Retrieval fallback warnings in logs
+- Supabase call retried once; local fallback then used automatically.
 
 ### No audio playback
-- Click the page once to unlock browser audio context.
+- Click page once to unlock browser audio context.
 - Check browser autoplay permissions.
-- Confirm `tts.chunk` messages appear in logs.
-
-### smallest.ai stream fails
-- Verify `SMALLEST_API_KEY` and `DEMO_MODE=false`.
-- Confirm firewall allows outbound WebSocket.
-- Server falls back to demo provider automatically when configured.
-
-### Commands not recognized
-- Use exact phrases first: `stop`, `resume`, `repeat`, `confirm`.
-- Ensure mic permissions are granted.
 
 ## Additional Docs
 - `ARCHITECTURE.md`

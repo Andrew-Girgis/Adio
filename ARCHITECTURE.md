@@ -1,64 +1,84 @@
 # Architecture
 
 ## Goal
-Keep latency low and interaction voice-native by treating speech as the primary transport and procedure state transitions as first-class logic.
+Keep latency low and interaction voice-native with stateful procedural execution, while grounding guidance in manuals and transcripts through deterministic retrieval/compilation pipelines.
 
 ## Components
 - `apps/web`
-  - Captures voice via browser SpeechRecognition.
-  - Streams user transcript (partial + final) over WebSocket.
-  - Plays streamed audio chunks immediately with Web Audio queue.
-  - Sends barge-in interrupt as soon as user speech starts.
+  - Voice capture + transcript streaming.
+  - Typed fallback and transcript file paste for YouTube mode.
+  - Streaming audio playback queue with barge-in interruption.
 - `apps/server`
-  - Session lifecycle and stateful procedure orchestration.
-  - Command interpretation and procedure progression.
-  - Retrieval over local manual chunks.
-  - smallest.ai Waves streaming TTS bridge via WebSocket.
-  - Demo TTS fallback provider for offline reliability.
-  - Structured logs + metrics + `/debug` endpoint.
+  - Session orchestration and Procedure Engine lifecycle.
+  - Command grammar handling (`stop/resume/repeat/skip/explain/safety check`).
+  - Manual RAG retrieval layer (Supabase pgvector + local fallback).
+  - YouTube transcript compiler pipeline.
+  - smallest.ai Waves streaming TTS bridge.
 - `packages/core`
-  - Shared protocol types.
-  - Command grammar parser.
-  - Procedure engine (confirmation-gated transitions).
-  - Manual corpus parsing + keyword retrieval stub.
+  - Shared WS protocol types.
+  - Procedure engine and command parser.
+  - Local manual parser/retrieval fallback.
+- `supabase/sql`
+  - pgvector schema + RPC for manuals.
+  - YouTube source/transcript/procedure persistence tables.
 
-## Real-Time Data Flow
-1. Client opens WS connection to `/ws`.
-2. Client sends `session.start` with issue/model text.
-3. Server retrieves best matching procedure from local manuals.
-4. Procedure engine emits current step prompt.
-5. Server streams prompt through TTS provider.
-6. Client receives `tts.chunk` and queues playback.
-7. User speech triggers `barge.in`; server aborts current stream.
-8. User command (`confirm`, `repeat`, etc.) updates engine state.
-9. Engine emits next utterance and cycle continues.
+## Data Model
+### Manual RAG
+- `manual_chunks`
+  - `product_domain`, `brand`, `model`, `section`, `source_ref`, `content`, `embedding vector(1536)`
+- RPC: `match_manual_chunks(query_embedding, match_count, domain_filter, brand_filter, model_filter)`
 
-## Procedure State Model
-- `idle`
-- `awaiting_confirmation`
-- `paused`
-- `completed`
+### YouTube Guide Mode
+- `video_sources`
+  - `id`, `url`, `title`, `created_at`
+- `video_transcripts`
+  - `id`, `video_id`, `raw_text`, `segments_json`, `created_at`
+- `video_procedures`
+  - `id`, `video_id`, `tools_json`, `procedure_json`, `safety_flags_json`, `created_at`
 
-Transition rules:
-- Start -> `awaiting_confirmation` on step 1.
-- `confirm` -> next step (or complete on final step).
-- `stop` -> `paused`.
-- `resume` -> `awaiting_confirmation` on current step.
-- `skip` on safety-critical step requires `skip confirm`.
+## Real-Time Execution Flows
+### A) Manual RAG Mode
+1. Client sends `session.start` with issue/model.
+2. Server loads procedure structure from local parser.
+3. Server retrieves supporting context chunks via Supabase RPC (or local fallback).
+4. Procedure Engine emits next step.
+5. TTS streams response audio to client.
+6. User command updates state machine.
 
-## smallest.ai Integration
-- Provider module: `apps/server/src/providers/smallest-waves-provider.ts`
-- Transport: outbound WebSocket to Waves stream endpoint.
-- Request shape (core fields): `voice_id`, `text`, `sample_rate`, `add_wav_header`, `continue`, `flush`.
-- Response handling: `chunk` messages with base64 audio and `complete` terminal message.
-- Resilience: retries with backoff and optional demo fallback.
+### B) YouTube Guide Mode
+1. Client sends `session.start` with mode `youtube` and transcript (plus optional URL).
+2. Transcript pipeline:
+   - normalize + clean while preserving timestamps
+   - extract tools/steps/decision points
+   - apply safety layer and warnings
+   - compile deterministic `procedure_json`
+3. Compiled procedure is converted to engine-compatible steps with timestamp citations.
+4. Procedure Engine executes one step at a time.
+5. `Explain` expands with grounded transcript segment for current step.
+6. Artifacts persist to Supabase if configured.
+
+## YouTube Compiler Pipeline
+`apps/server/src/youtube`
+- `parseUrl.ts` - validates/extracts YouTube id.
+- `transcriptIngest.ts` - source ingest + fallback prompting + persistence.
+- `transcriptCleaner.ts` - normalization + timestamp-preserving segmentation.
+- `procedureCompiler.ts` - deterministic transcript -> step compiler.
+- `safetyLayer.ts` - non-negotiable high-risk gating/warning insertion.
+
+## Safety Layer Rules
+If step text indicates electricity, gas, water lines, vehicle jacks, or pressure systems:
+- mark step `safety_level: high`
+- force `requires_confirmation: true`
+
+If unsafe transcript behavior is detected, insert a warning step before execution continues.
+
+## Reliability Strategy
+- Missing Supabase keys -> local retrieval fallback.
+- Supabase RPC failure -> retry once -> fallback.
+- Missing transcript for YouTube mode -> explicit clarifying prompt (no hallucination).
+- smallest.ai failures -> retries + demo TTS fallback.
 
 ## Observability
-- JSON structured logs (`level`, `event`, `sessionId`, provider metadata).
-- Metrics:
-  - active/total sessions
-  - total streams
-  - TTS error count
-  - rolling average TTFA
-  - per-stream throughput proxy
-- `GET /debug` returns live session + stream diagnostic snapshot.
+- Structured server logs with mode + retrieval source.
+- TTFA + stream throughput metrics via WS events.
+- `/debug` endpoint shows active sessions and mode/state details.

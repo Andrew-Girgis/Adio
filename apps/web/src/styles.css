@@ -87,6 +87,29 @@ input {
   font: inherit;
 }
 
+select,
+textarea {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 96px;
+}
+
+input[type="file"] {
+  padding: 8px;
+}
+
+.helper-copy {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 button {
   border: 1px solid var(--line);
   border-radius: 10px;

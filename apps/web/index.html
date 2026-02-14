@@ -20,6 +20,13 @@
         <section class="panel controls">
           <h2>Session</h2>
           <label>
+            Mode
+            <select id="modeSelect">
+              <option value="manual" selected>Manual RAG Mode</option>
+              <option value="youtube">YouTube Guide Mode</option>
+            </select>
+          </label>
+          <label>
             Issue
             <input id="issueInput" placeholder="Dishwasher is not draining" value="Dishwasher is not draining" />
           </label>
@@ -27,6 +34,21 @@
             Model (optional)
             <input id="modelInput" placeholder="KDFE104HPS" />
           </label>
+          <label>
+            YouTube URL (optional)
+            <input id="youtubeUrlInput" placeholder="https://www.youtube.com/watch?v=..." />
+          </label>
+          <label>
+            Transcript Paste (.txt/.vtt/.srt)
+            <textarea id="transcriptInput" rows="5" placeholder="Paste transcript text here for YouTube Guide Mode"></textarea>
+          </label>
+          <label>
+            Transcript File (optional)
+            <input id="transcriptFileInput" type="file" accept=".txt,.vtt,.srt,text/plain" />
+          </label>
+          <p class="helper-copy">
+            In YouTube Guide Mode, transcript paste/file is preferred for deterministic procedure compilation.
+          </p>
           <button id="startSessionBtn" class="primary">Start Voice Session</button>
 
           <div class="mic-row">

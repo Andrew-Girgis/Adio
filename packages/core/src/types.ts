@@ -76,6 +76,10 @@ export interface StartSessionPayload {
   issue: string;
   modelNumber?: string;
   demoMode?: boolean;
+  mode?: "manual" | "youtube";
+  youtubeUrl?: string;
+  transcriptText?: string;
+  videoTitle?: string;
 }
 
 export interface UserTextPayload {
@@ -92,6 +96,15 @@ export type ClientWsMessage =
   | { type: "session.stop" };
 
 export type TtsEndReason = "complete" | "stopped" | "error";
+
+export interface RetrievalCitation {
+  sourceRef: string | null;
+  section: string | null;
+  similarity: number;
+  productDomain: "appliance" | "auto";
+  brand: string | null;
+  model: string | null;
+}
 
 export type ServerWsMessage =
   | {
@@ -113,6 +126,15 @@ export type ServerWsMessage =
       type: "assistant.message";
       payload: {
         text: string;
+        citations?: RetrievalCitation[];
+      };
+    }
+  | {
+      type: "rag.context";
+      payload: {
+        query: string;
+        source: "supabase" | "local";
+        citations: RetrievalCitation[];
       };
     }
   | {

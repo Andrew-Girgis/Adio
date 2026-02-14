@@ -1,27 +1,35 @@
 # Security
 
 ## Current Threat Model
-Scope is hackathon MVP with minimal auth and local/manual data only.
+Hackathon MVP scope with server-side orchestration and optional Supabase persistence.
 
 Primary concerns:
-- Untrusted WebSocket payloads.
-- Prompt/content misuse via arbitrary user text.
-- Potential leakage of API keys.
+- Untrusted WebSocket inputs.
+- API key leakage.
+- Over-collection of user data.
 
-## Mitigations Implemented
-- JSON parse guards and typed message routing.
-- Command- and state-constrained behavior (reduced arbitrary action space).
-- `.env`-based secret loading with no secret committed to repo.
-- No code execution tools exposed to end users.
+## Data Handling Policy
+- No raw microphone audio is persisted by this app.
+- No YouTube video/audio blobs are stored.
+- YouTube Guide Mode stores transcript text + structured procedure artifacts only.
+- Transcript/session persistence is optional and server-controlled.
+
+## Implemented Mitigations
+- Typed message routing with JSON parse guards.
+- Procedure engine constrained command surface.
+- Clarifying-question behavior when transcript data is incomplete (no hallucinated steps).
+- Supabase service role key is server-only and never shipped to client.
+- Local fallback mode preserves functionality if external services fail.
 
 ## Known Gaps (MVP)
-- No authentication/authorization on WS channel.
+- No auth on WS channel.
 - No rate limiting.
-- No per-IP abuse controls.
-- Browser SpeechRecognition privacy depends on browser vendor implementation.
+- No per-user quotas.
+- Browser SpeechRecognition privacy depends on browser implementation.
 
 ## Recommended Next Steps
-1. Add session auth token and origin allowlist validation.
-2. Add server-side rate limiting and payload size limits.
-3. Add audit logging for security-significant events.
-4. Add dependency scanning and CI checks.
+1. Add authenticated sessions and origin allowlist checks.
+2. Add rate limiting and payload size limits.
+3. Add data retention controls for transcript tables.
+4. Add audit logs for sensitive operations.
+5. Add CI security scans/dependency checks.
