@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Adio | Voice-First Repair Companion</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <p class="eyebrow">AI Agents Waterloo Voice Hackathon</p>
+        <h1>Adio</h1>
+        <p class="tagline">Hands-free procedural repair guidance with interruption-aware voice control.</p>
+      </header>
+
+      <main class="layout">
+        <section class="panel controls">
+          <h2>Session</h2>
+          <label>
+            Issue
+            <input id="issueInput" placeholder="Dishwasher is not draining" value="Dishwasher is not draining" />
+          </label>
+          <label>
+            Model (optional)
+            <input id="modelInput" placeholder="KDFE104HPS" />
+          </label>
+          <button id="startSessionBtn" class="primary">Start Voice Session</button>
+
+          <div class="mic-row">
+            <button id="micBtn" class="secondary">Start Mic</button>
+            <span id="micStatus">Mic idle</span>
+          </div>
+
+          <div class="status-block">
+            <p><strong>Status:</strong> <span id="sessionStatus">Disconnected</span></p>
+            <p><strong>Procedure:</strong> <span id="procedureLabel">-</span></p>
+            <p><strong>Manual:</strong> <span id="manualLabel">-</span></p>
+            <p><strong>Engine:</strong> <span id="engineLabel">-</span></p>
+          </div>
+
+          <div class="command-grid" id="commandGrid">
+            <button data-command="stop">Stop</button>
+            <button data-command="resume">Resume</button>
+            <button data-command="repeat">Repeat</button>
+            <button data-command="skip">Skip</button>
+            <button data-command="explain">Explain</button>
+            <button data-command="safety_check">Safety Check</button>
+            <button data-command="confirm">Confirm</button>
+          </div>
+
+          <div class="metrics">
+            <h3>Debug Metrics</h3>
+            <pre id="metricsOutput">No stream metrics yet.</pre>
+            <a href="http://localhost:8787/debug" target="_blank" rel="noreferrer">Open /debug endpoint</a>
+          </div>
+        </section>
+
+        <section class="panel transcript-panel">
+          <h2>Transcript</h2>
+          <div id="transcript" class="transcript"></div>
+
+          <form id="typedForm" class="typed-row">
+            <input id="typedInput" placeholder="Typed fallback: e.g., repeat that step" />
+            <button type="submit" class="primary">Send</button>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
