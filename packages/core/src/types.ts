@@ -1,4 +1,5 @@
 export type VoiceCommand =
+  | "start"
   | "stop"
   | "resume"
   | "repeat"
@@ -40,6 +41,11 @@ export interface ProcedureStateSnapshot {
 
 export interface EngineResult {
   text: string;
+  /**
+   * Optional, shorter voice-friendly variant of `text`.
+   * When present, clients should prefer this for TTS.
+   */
+  speechText?: string;
   state: ProcedureStateSnapshot;
   shouldSpeak: boolean;
 }
@@ -80,6 +86,8 @@ export interface StartSessionPayload {
   youtubeUrl?: string;
   transcriptText?: string;
   videoTitle?: string;
+  youtubeForceRefresh?: boolean;
+  youtubePreferredLanguage?: string;
 }
 
 export interface UserTextPayload {
@@ -88,14 +96,42 @@ export interface UserTextPayload {
   isFinal?: boolean;
 }
 
+export type AudioEncoding = "linear16";
+
+export interface AudioStartPayload {
+  /**
+   * For smallest Pulse STT, stream raw binary PCM16 ("linear16") @ 16000Hz.
+   * Audio chunks are sent as raw WebSocket binary frames between `audio.start` and `audio.end` (preferred),
+   * or as `audio.chunk` base64 payloads (fallback).
+   */
+  encoding: AudioEncoding;
+  sampleRate: number;
+  language?: string;
+}
+
+export interface AudioChunkPayload {
+  seq?: number;
+  chunkBase64: string;
+}
+
+export interface AudioEndPayload {
+  reason?: string;
+}
+
 export type ClientWsMessage =
   | { type: "session.start"; payload: StartSessionPayload }
   | { type: "user.text"; payload: UserTextPayload }
   | { type: "voice.command"; payload: { command: VoiceCommand; raw?: string } }
   | { type: "barge.in"; payload?: { reason?: string } }
+  | { type: "audio.start"; payload: AudioStartPayload }
+  | { type: "audio.chunk"; payload: AudioChunkPayload }
+  | { type: "audio.end"; payload?: AudioEndPayload }
   | { type: "session.stop" };
 
 export type TtsEndReason = "complete" | "stopped" | "error";
+
+export type YoutubeStatusStage = "extracting_transcript" | "compiling_guide" | "preparing_voice" | "ready";
+export type TtsStatusStage = "attempting" | "retrying" | "fallback";
 
 export interface RetrievalCitation {
   sourceRef: string | null;
@@ -107,15 +143,19 @@ export interface RetrievalCitation {
 }
 
 export type ServerWsMessage =
-  | {
-      type: "session.ready";
-      payload: {
-        sessionId: string;
-        demoMode: boolean;
-        procedureTitle: string;
-        manualTitle: string;
-      };
-    }
+	  | {
+	      type: "session.ready";
+	      payload: {
+	        sessionId: string;
+	        demoMode: boolean;
+	        voice: {
+	          ttsProvider: string;
+	          sttProvider: "smallest-pulse" | "browser-speech";
+	        };
+	        procedureTitle: string;
+	        manualTitle: string;
+	      };
+	    }
   | {
       type: "engine.state";
       payload: {
@@ -181,6 +221,43 @@ export type ServerWsMessage =
         streamId: string;
         timeToFirstAudioMs: number;
         approxCharsPerSecond?: number;
+      };
+    }
+  | {
+      type: "stt.metrics";
+      payload: {
+        streamId: string;
+        provider: string;
+        timeToFirstTranscriptMs: number | null;
+        partialCadenceMs: number | null;
+        finalizationLatencyMs: number | null;
+        partialCount: number;
+      };
+    }
+  | {
+      type: "youtube.status";
+      payload: {
+        stage: YoutubeStatusStage;
+        message: string;
+      };
+    }
+  | {
+      type: "tts.status";
+      payload: {
+        stage: TtsStatusStage;
+        provider: string;
+        attempt: number;
+        message: string;
+      };
+    }
+  | {
+      type: "tts.error";
+      payload: {
+        code: string;
+        provider: string;
+        retryable: boolean;
+        fallbackUsed: boolean;
+        message: string;
       };
     }
   | {

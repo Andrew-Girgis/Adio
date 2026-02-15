@@ -2,6 +2,12 @@ import type { VoiceCommand } from "./types";
 
 const COMMAND_PATTERNS: Array<{ command: VoiceCommand; patterns: RegExp[] }> = [
   {
+    command: "start",
+    patterns: [
+      /^\s*(ready|start|begin|let's begin|let's start|i am ready|i'm ready|im ready)\s*$/i
+    ]
+  },
+  {
     command: "stop",
     patterns: [/\bstop\b/i, /\bpause\b/i, /\bhold on\b/i]
   },
@@ -27,11 +33,20 @@ const COMMAND_PATTERNS: Array<{ command: VoiceCommand; patterns: RegExp[] }> = [
   },
   {
     command: "safety_check",
-    patterns: [/\bsafety check\b/i, /\bis this safe\b/i, /\bsafety\b/i]
+    patterns: [
+      /^\s*(safety\s*check|safety)\s*[.!?]*\s*$/i,
+      /^\s*(is|am)\s+(this|it|that)\s+safe\b.*$/i,
+      /^\s*safe\s+to\b.*$/i,
+      /^\s*(any|what)\s+(risk|danger)\b.*$/i
+    ]
   },
   {
     command: "confirm",
-    patterns: [/\bconfirm\b/i, /\bdone\b/i, /\bcompleted\b/i, /\bnext\b/i, /\byes\b/i]
+    patterns: [
+      /^\s*(confirm|confirmed)\s*[.!?]*\s*$/i,
+      /^\s*(done|all done|completed|finished)\s*[.!?]*\s*$/i,
+      /^\s*(that'?s done|that is done)\s*[.!?]*\s*$/i
+    ]
   }
 ];
 

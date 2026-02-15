@@ -31,6 +31,7 @@ export class ProcedureEngine {
       this.awaitingConfirmation = false;
       return {
         text: "I could not find actionable steps in this manual. Try a different issue description.",
+        speechText: "I could not find steps for that. Try a different issue description.",
         state: this.getState(),
         shouldSpeak: true
       };
@@ -38,7 +39,7 @@ export class ProcedureEngine {
 
     this.status = "awaiting_confirmation";
     this.awaitingConfirmation = true;
-    return this.renderCurrentStep("Starting procedure.");
+    return this.renderCurrentStep();
   }
 
   handleCommand(command: VoiceCommand): EngineResult {
@@ -53,11 +54,26 @@ export class ProcedureEngine {
     }
 
     switch (command) {
+      case "start":
+        if (this.status === "idle") {
+          return this.start();
+        }
+
+        if (this.status === "paused") {
+          return this.simpleResponse("You are paused. Say resume to continue.", "Paused. Say resume to continue.");
+        }
+
+        return this.simpleResponse(
+          "Procedure already started. Say confirm when done, or say repeat or explain.",
+          "Already started. Say confirm when done."
+        );
+
       case "stop":
         this.status = "paused";
         this.awaitingConfirmation = false;
         return {
           text: `Paused at step ${this.currentStepIndex + 1}. Say resume when you are ready.`,
+          speechText: "Paused. Say resume when you are ready.",
           state: this.getState(),
           shouldSpeak: true
         };
@@ -65,59 +81,72 @@ export class ProcedureEngine {
       case "resume":
         if (this.status !== "paused") {
           return {
-            text: "I am already active. Say repeat if you want the current step again.",
+            text: "Already active. Say repeat if you want the current step again.",
+            speechText: "Already active. Say repeat if you want the step again.",
             state: this.getState(),
             shouldSpeak: true
           };
         }
         this.status = "awaiting_confirmation";
         this.awaitingConfirmation = true;
-        return this.renderCurrentStep("Resuming.");
+        return this.renderCurrentStep();
 
       case "repeat":
-        return this.renderCurrentStep("Repeating current step.");
+        return this.renderCurrentStep();
 
       case "explain":
         if (!step) {
-          return this.simpleResponse("No active step to explain.");
+          return this.simpleResponse("No active step to explain.", "No active step to explain.");
         }
-        return this.simpleResponse(step.explanation ?? "This step reduces risk and keeps diagnosis accurate before moving on.");
+        return this.simpleResponse(
+          step.explanation ?? "This step reduces risk and keeps diagnosis accurate before moving on.",
+          step.explanation ?? "This step helps reduce risk before you move on."
+        );
 
       case "safety_check":
         if (!step) {
-          return this.simpleResponse("No active step for safety check.");
+          return this.simpleResponse("No active step for safety check.", "No active step for safety check.");
         }
         return this.simpleResponse(
           step.safetyNotes ??
-            "Wear gloves, power down equipment before opening panels, and stop if you detect burning smells or fluid leaks."
+            "Wear gloves, power down equipment before opening panels, and stop if you detect burning smells or fluid leaks.",
+          this.shortenForSpeech(
+            step.safetyNotes ??
+              "Wear gloves, power down equipment before opening panels, and stop if you detect burning smells or fluid leaks.",
+            180
+          )
         );
 
       case "skip":
         if (!step) {
-          return this.simpleResponse("No remaining step to skip.");
+          return this.simpleResponse("No remaining step to skip.", "No remaining step to skip.");
         }
         if (step.safetyCritical) {
           this.skipNeedsConfirmation = true;
           return this.simpleResponse(
-            "This is a safety-critical step. Say skip confirm to proceed, or say repeat to hear it again."
+            "This is a safety-critical step. Say skip confirm to proceed, or say repeat to hear it again.",
+            "That step is safety-critical. Say skip confirm to proceed, or say repeat."
           );
         }
         return this.advanceStep(true);
 
       case "skip_confirm":
         if (!this.skipNeedsConfirmation) {
-          return this.simpleResponse("No skip confirmation is pending.");
+          return this.simpleResponse("No skip confirmation is pending.", "No skip confirmation is pending.");
         }
         return this.advanceStep(true);
 
       case "confirm":
         if (this.status === "paused") {
-          return this.simpleResponse("You are paused. Say resume first.");
+          return this.simpleResponse("You are paused. Say resume first.", "Paused. Say resume first.");
         }
         return this.advanceStep(false);
 
       default:
-        return this.simpleResponse("I did not catch that command. Try stop, resume, repeat, skip, explain, or safety check.");
+        return this.simpleResponse(
+          "I did not catch that. Try: confirm, repeat, explain, safety check, stop, or resume.",
+          "I did not catch that. Try confirm, repeat, explain, or safety check."
+        );
     }
   }
 
@@ -137,41 +166,47 @@ export class ProcedureEngine {
       this.status = "completed";
       this.awaitingConfirmation = false;
       const ending = skipped
-        ? "Skipped the final step. Procedure complete. Run a safety check before testing the appliance."
-        : "Great work. Procedure complete. Run a quick safety check, then test the appliance.";
-      return this.simpleResponse(ending);
+        ? "Skipped the final step. Procedure complete. Run a quick safety check before testing."
+        : "Procedure complete. Run a quick safety check, then test.";
+      const endingSpeech = skipped
+        ? "Procedure complete. Do a quick safety check before testing."
+        : "Procedure complete. Do a quick safety check, then test.";
+      return this.simpleResponse(ending, endingSpeech);
     }
 
     this.status = "awaiting_confirmation";
     this.awaitingConfirmation = true;
-    const prefix = skipped ? "Step skipped." : "Confirmed.";
-    return this.renderCurrentStep(prefix);
+    return this.renderCurrentStep(skipped ? "Step skipped." : undefined);
   }
 
   private renderCurrentStep(prefix?: string): EngineResult {
     const step = this.getCurrentStep();
     if (!step) {
-      return this.simpleResponse("No active step.");
+      return this.simpleResponse("No active step.", "No active step.");
     }
 
     const stepNumber = this.currentStepIndex + 1;
     const total = this.procedure.steps.length;
-    const safetyPreface = step.safetyCritical ? "Safety-critical. " : "";
-    const confirmationPrompt =
-      step.requiresConfirmation
-        ? 'Say "confirm" when done, or say stop, repeat, explain, skip, or safety check.'
-        : 'Say "confirm" to advance.';
+    const safetyLine = this.buildSafetyLine(step);
+    const displaySafety = safetyLine ? `Safety: ${safetyLine}` : null;
 
-    const composed = [
-      prefix,
-      `${safetyPreface}Step ${stepNumber} of ${total}: ${step.instruction}`,
-      confirmationPrompt
-    ]
+    const displayPrompt = step.requiresConfirmation
+      ? 'Say "confirm" when done. You can also say repeat, explain, safety check, stop, or skip.'
+      : 'Say "confirm" when you are ready to advance.';
+
+    const display = [`Step ${stepNumber} of ${total}: ${step.instruction}`, displaySafety, displayPrompt]
+      .filter(Boolean)
+      .join(" ");
+    const displayWithPrefix = prefix ? `${prefix} ${display}` : display;
+
+    const speechPrompt = "When you're done, say confirm.";
+    const speech = [`Step ${stepNumber}.`, step.instruction, displaySafety, speechPrompt]
       .filter(Boolean)
       .join(" ");
 
     return {
-      text: composed,
+      text: displayWithPrefix,
+      speechText: speech,
       state: this.getState(),
       shouldSpeak: true
     };
@@ -181,9 +216,39 @@ export class ProcedureEngine {
     return this.procedure.steps[this.currentStepIndex];
   }
 
-  private simpleResponse(text: string): EngineResult {
+  private buildSafetyLine(step: ProcedureStep): string | null {
+    const safetyNotes = step.safetyNotes?.trim();
+    if (safetyNotes) {
+      return this.shortenForSpeech(safetyNotes, 140);
+    }
+
+    if (step.safetyCritical) {
+      return "Disconnect power and keep hands clear of moving parts.";
+    }
+
+    return null;
+  }
+
+  private shortenForSpeech(text: string, maxChars: number): string {
+    const cleaned = text.replace(/\s+/g, " ").trim();
+    if (cleaned.length <= maxChars) {
+      return cleaned;
+    }
+
+    const sentenceEnd = cleaned.search(/[.!?](?=\s|$)/);
+    if (sentenceEnd !== -1 && sentenceEnd + 1 <= maxChars) {
+      return cleaned.slice(0, sentenceEnd + 1);
+    }
+
+    const clipped = cleaned.slice(0, maxChars);
+    const lastSpace = clipped.lastIndexOf(" ");
+    return (lastSpace > 40 ? clipped.slice(0, lastSpace) : clipped).trimEnd() + "...";
+  }
+
+  private simpleResponse(text: string, speechText?: string): EngineResult {
     return {
       text,
+      speechText: speechText ?? text,
       state: this.getState(),
       shouldSpeak: true
     };

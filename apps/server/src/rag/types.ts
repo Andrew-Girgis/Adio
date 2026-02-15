@@ -11,6 +11,10 @@ export interface RagRetrievedChunk {
   content: string;
   section: string | null;
   sourceRef: string | null;
+  documentId: string | null;
+  documentTitle: string | null;
+  pageStart: number | null;
+  pageEnd: number | null;
   brand: string | null;
   model: string | null;
   productDomain: ProductDomain;
@@ -51,6 +55,9 @@ export interface ParsedManualDocument {
 export interface RagCitation {
   sourceRef: string | null;
   section: string | null;
+  documentTitle: string | null;
+  pageStart: number | null;
+  pageEnd: number | null;
   similarity: number;
   productDomain: ProductDomain;
   brand: string | null;

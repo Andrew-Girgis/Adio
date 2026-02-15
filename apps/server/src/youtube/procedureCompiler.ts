@@ -2,6 +2,7 @@ import type { ProcedureDefinition, ProcedureStep } from "@adio/core/server";
 import { inferDomainFromText } from "../rag/chunking";
 import { applySafetyLayer } from "./safetyLayer";
 import type {
+  CaptionExtractionSource,
   CompiledProcedureJson,
   CompiledProcedureStep,
   NormalizedTranscript,
@@ -13,6 +14,21 @@ const ACTION_HINT_PATTERN =
   /\b(remove|disconnect|turn off|turn on|unscrew|tighten|check|inspect|clean|replace|install|reconnect|test|verify|drain|lift|jack|bleed|secure|start|stop|run|attach|detach)\b/i;
 
 const DECISION_PATTERN = /\bif\b.+\b(then|else|otherwise)\b/i;
+
+export const YOUTUBE_COMPILER_VERSION = "v1";
+
+interface BuildYoutubeOutputInput {
+  video: VideoSourceMetadata;
+  normalizedTranscript: NormalizedTranscript;
+  compiledProcedure: CompiledProcedureJson;
+  fallbackIssueTitle: string;
+  safetyFlags: string[];
+  clarifyingQuestions: string[];
+  warnings: string[];
+  extractionSource?: CaptionExtractionSource;
+  languageCode?: string;
+  cacheHit?: boolean;
+}
 
 export function compileTranscriptToProcedure(input: {
   video: VideoSourceMetadata;
@@ -43,25 +59,43 @@ export function compileTranscriptToProcedure(input: {
       ? input.video.title
       : `YouTube Guide: ${input.fallbackIssueTitle}`;
 
-  const compiledProcedure: CompiledProcedureJson = {
-    title,
-    tools_required: tools,
-    steps: safetyResult.steps
-  };
-
-  const engineProcedure = toEngineProcedure(compiledProcedure, input.video);
-  const stepExplainMap = buildExplainMap(compiledProcedure.steps);
-
-  return {
+  return buildYoutubeOutputFromCompiled({
     video: input.video,
     normalizedTranscript: input.normalizedTranscript,
-    compiledProcedure,
-    engineProcedure,
+    fallbackIssueTitle: input.fallbackIssueTitle,
+    compiledProcedure: {
+      title,
+      tools_required: tools,
+      steps: safetyResult.steps
+    },
     safetyFlags: safetyResult.safetyFlags,
     clarifyingQuestions,
     warnings: safetyResult.warnings,
+    extractionSource: "manual",
+    languageCode: "unknown",
+    cacheHit: false
+  });
+}
+
+export function buildYoutubeOutputFromCompiled(input: BuildYoutubeOutputInput): YoutubeCompileOutput {
+  const engineProcedure = toEngineProcedure(input.compiledProcedure, input.video);
+  const stepExplainMap = buildExplainMap(input.compiledProcedure.steps);
+
+  return {
+    video: input.video,
+    languageCode: input.languageCode ?? "unknown",
+    extractionSource: input.extractionSource ?? "manual",
+    cacheHit: input.cacheHit ?? false,
+    compilerVersion: YOUTUBE_COMPILER_VERSION,
+    normalizedTranscript: input.normalizedTranscript,
+    compiledProcedure: input.compiledProcedure,
+    engineProcedure,
+    safetyFlags: input.safetyFlags,
+    clarifyingQuestions: input.clarifyingQuestions,
+    warnings: input.warnings,
     stepExplainMap,
-    productDomain: inferDomainFromText(`${title} ${input.fallbackIssueTitle}`) ?? "appliance"
+    stepContextMap: {},
+    productDomain: inferDomainFromText(`${input.compiledProcedure.title} ${input.fallbackIssueTitle}`) ?? "appliance"
   };
 }
 

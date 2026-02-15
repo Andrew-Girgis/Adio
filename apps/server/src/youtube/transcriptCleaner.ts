@@ -12,27 +12,62 @@ const FILLER_WORDS = [
   "literally"
 ];
 
-const VTT_RANGE_PATTERN =
-  /^(\d{2}:\d{2}:\d{2}[\.,]\d{3}|\d{2}:\d{2}[\.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[\.,]\d{3}|\d{2}:\d{2}[\.,]\d{3})/;
+const RANGE_PATTERN =
+  /^(\d{1,2}:\d{2}(?::\d{2})?[\.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?[\.,]\d{3})(?:\s+.*)?$/;
 const BRACKET_TIMESTAMP_PATTERN = /^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s+(.+)$/;
+
+interface RawSegmentInput {
+  startSec: number | null;
+  endSec: number | null;
+  text: string;
+  rawText?: string;
+}
 
 export function cleanTranscript(rawText: string): NormalizedTranscript {
   const parsedSegments = parseTranscriptSegments(rawText);
-  const merged = mergeBrokenSentences(parsedSegments);
-  const cleaned = merged.map((segment, index) => {
-    const cleanedText = cleanSegmentText(segment.text);
-    return {
-      ...segment,
+  return normalizeParsedSegments(parsedSegments, rawText);
+}
+
+export function cleanTranscriptFromSegments(segments: RawSegmentInput[], rawText?: string): NormalizedTranscript {
+  const parsed = segments
+    .map((segment, index) => ({
       index: index + 1,
-      text: cleanedText,
-      rawText: segment.rawText
-    };
-  });
+      startSec: segment.startSec,
+      endSec: segment.endSec,
+      timestampRange: toTimestampRange(segment.startSec, segment.endSec),
+      text: segment.text,
+      rawText: segment.rawText ?? segment.text
+    }))
+    .filter((segment) => segment.text.trim().length > 0);
+
+  const fallbackRawText =
+    rawText ??
+    parsed
+      .map((segment) => `${segment.timestampRange}\n${segment.rawText}`)
+      .filter(Boolean)
+      .join("\n\n");
+
+  return normalizeParsedSegments(parsed, fallbackRawText);
+}
+
+function normalizeParsedSegments(parsedSegments: TranscriptSegment[], rawText: string): NormalizedTranscript {
+  const merged = mergeBrokenSentences(parsedSegments);
+  const cleaned = merged
+    .map((segment, index) => {
+      const cleanedText = cleanSegmentText(segment.text);
+      return {
+        ...segment,
+        index: index + 1,
+        text: cleanedText,
+        rawText: segment.rawText
+      };
+    })
+    .filter((segment) => segment.text.length > 0);
 
   return {
     rawText,
     cleanedTranscript: cleaned.map((segment) => segment.text).join(" "),
-    segments: cleaned.filter((segment) => segment.text.length > 0)
+    segments: cleaned
   };
 }
 
@@ -49,7 +84,12 @@ function parseTranscriptSegments(rawText: string): TranscriptSegment[] {
       continue;
     }
 
-    const rangeMatch = line.match(VTT_RANGE_PATTERN);
+    if (isTranscriptHeaderLine(line)) {
+      cursor += 1;
+      continue;
+    }
+
+    const rangeMatch = line.match(RANGE_PATTERN);
     if (rangeMatch) {
       const startSec = parseTimestampToSeconds(rangeMatch[1]);
       const endSec = parseTimestampToSeconds(rangeMatch[2]);
@@ -57,11 +97,14 @@ function parseTranscriptSegments(rawText: string): TranscriptSegment[] {
 
       const textLines: string[] = [];
       while (cursor < lines.length && lines[cursor].trim() !== "") {
-        textLines.push(lines[cursor].trim());
+        const cueLine = lines[cursor].trim();
+        if (!isTranscriptHeaderLine(cueLine) && !/^\d+$/.test(cueLine)) {
+          textLines.push(cueLine);
+        }
         cursor += 1;
       }
 
-      const text = textLines.join(" ").trim();
+      const text = stripCueMarkup(textLines.join(" ").trim());
       if (text) {
         segments.push({
           index: segments.length + 1,
@@ -78,34 +121,63 @@ function parseTranscriptSegments(rawText: string): TranscriptSegment[] {
     const bracketMatch = line.match(BRACKET_TIMESTAMP_PATTERN);
     if (bracketMatch) {
       const startSec = parseTimestampToSeconds(bracketMatch[1]);
-      const text = bracketMatch[2].trim();
-      segments.push({
-        index: segments.length + 1,
-        startSec,
-        endSec: null,
-        timestampRange: toTimestampRange(startSec, null),
-        text,
-        rawText: text
-      });
+      const text = stripCueMarkup(bracketMatch[2].trim());
+      if (text) {
+        segments.push({
+          index: segments.length + 1,
+          startSec,
+          endSec: null,
+          timestampRange: toTimestampRange(startSec, null),
+          text,
+          rawText: text
+        });
+      }
       cursor += 1;
       continue;
     }
 
     if (!/^\d+$/.test(line)) {
-      segments.push({
-        index: segments.length + 1,
-        startSec: null,
-        endSec: null,
-        timestampRange: "unknown",
-        text: line,
-        rawText: line
-      });
+      const text = stripCueMarkup(line);
+      if (text) {
+        segments.push({
+          index: segments.length + 1,
+          startSec: null,
+          endSec: null,
+          timestampRange: "unknown",
+          text,
+          rawText: text
+        });
+      }
     }
 
     cursor += 1;
   }
 
   return segments;
+}
+
+function isTranscriptHeaderLine(line: string): boolean {
+  const normalized = line.trim().toUpperCase();
+  return (
+    normalized === "WEBVTT" ||
+    normalized.startsWith("NOTE") ||
+    normalized.startsWith("STYLE") ||
+    normalized.startsWith("REGION") ||
+    normalized.startsWith("KIND:") ||
+    normalized.startsWith("LANGUAGE:")
+  );
+}
+
+function stripCueMarkup(text: string): string {
+  return text
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\{[^}]+\}/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function mergeBrokenSentences(segments: TranscriptSegment[]): TranscriptSegment[] {

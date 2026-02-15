@@ -1,42 +1,45 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { compileTranscriptToProcedure } from "./procedureCompiler";
-import { ingestTranscriptSource, persistYoutubeArtifacts } from "./transcriptIngest";
-import type { TranscriptIngestInput, YoutubeCompileOutput } from "./types";
+import type { AppConfig } from "../config";
+import type { RagRetrievedChunk } from "../rag/types";
+import { runYoutubePipeline, type YoutubePipelineCompileResult } from "./pipeline";
+import { upsertYoutubeArtifacts } from "./transcriptCache";
+import type { TranscriptIngestInput, YoutubeCompileOutput, YoutubePipelineStatus } from "./types";
 
-export interface YoutubeCompileResult {
-  ok: boolean;
-  compiled?: YoutubeCompileOutput;
-  clarifyingQuestions: string[];
-  warnings: string[];
+export interface YoutubeCompileDependencies {
+  config: AppConfig;
+  supabase: SupabaseClient | null;
+  retrieveManualContext?: (
+    query: string,
+    domain: "appliance" | "auto",
+    topK: number
+  ) => Promise<RagRetrievedChunk[]>;
+  onStatus?: (status: YoutubePipelineStatus) => void;
 }
 
-export async function compileYoutubeProcedure(input: TranscriptIngestInput): Promise<YoutubeCompileResult> {
-  const ingest = await ingestTranscriptSource(input);
-  if (!ingest.ok || !ingest.normalizedTranscript) {
-    return {
-      ok: false,
-      clarifyingQuestions: ingest.clarifyingQuestions,
-      warnings: ingest.warnings
-    };
-  }
+export type YoutubeCompileResult = YoutubePipelineCompileResult;
 
-  const compiled = compileTranscriptToProcedure({
-    video: ingest.metadata,
-    normalizedTranscript: ingest.normalizedTranscript,
-    fallbackIssueTitle: input.issue
+export async function compileYoutubeProcedure(
+  input: TranscriptIngestInput,
+  deps: YoutubeCompileDependencies
+): Promise<YoutubeCompileResult> {
+  return runYoutubePipeline(input, {
+    config: deps.config,
+    supabase: deps.supabase,
+    retrieveManualContext: deps.retrieveManualContext,
+    onStatus: deps.onStatus
   });
-
-  return {
-    ok: compiled.clarifyingQuestions.length === 0,
-    compiled,
-    clarifyingQuestions: [...ingest.clarifyingQuestions, ...compiled.clarifyingQuestions],
-    warnings: [...ingest.warnings, ...compiled.warnings]
-  };
 }
 
 export async function persistYoutubeProcedureIfEnabled(
   supabase: SupabaseClient | null,
   compiled: YoutubeCompileOutput
 ): Promise<void> {
-  await persistYoutubeArtifacts(supabase, compiled);
+  if (!supabase) {
+    return;
+  }
+
+  await upsertYoutubeArtifacts({
+    supabase,
+    compiled
+  });
 }

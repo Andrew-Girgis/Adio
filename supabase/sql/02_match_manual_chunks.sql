@@ -15,9 +15,13 @@ returns table (
   product_domain text,
   similarity double precision
 )
-language sql
+language plpgsql
 stable
 as $$
+begin
+  perform set_config('ivfflat.probes', '10', true);
+
+  return query
   select
     mc.id,
     mc.content,
@@ -45,4 +49,5 @@ as $$
     end desc,
     mc.embedding <=> query_embedding asc
   limit greatest(match_count, 1);
+end;
 $$;

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "pnpm --parallel --filter @adio/server --filter @adio/web dev",
     "ingest:manuals": "pnpm --filter @adio/server ingest:manuals",
+    "ingest:pdfs": "python3 scripts/ingest_appliance_pdfs.py --docs-dir ./appliance_docs",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck"
   }

@@ -16,10 +16,15 @@ interface MatchManualChunkRow {
   content: string;
   section: string | null;
   source_ref: string | null;
+  document_id: string | null;
+  document_title: string | null;
+  page_start: number | null;
+  page_end: number | null;
   brand: string | null;
   model: string | null;
   product_domain: "appliance" | "auto";
-  similarity: number;
+  similarity?: number;
+  hybrid_score?: number;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -35,10 +40,12 @@ export async function retrieveChunksFromSupabase(input: RetrieveChunksInput): Pr
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const { data, error } = await input.supabase.rpc("match_manual_chunks", {
       query_embedding: queryEmbedding,
+      query_text: input.query,
       match_count: topK,
       domain_filter: input.filters?.domainFilter ?? null,
       brand_filter: input.filters?.brandFilter ?? null,
-      model_filter: input.filters?.modelFilter ?? null
+      model_filter: input.filters?.modelFilter ?? null,
+      candidate_count: Math.max(120, topK * 15)
     });
 
     if (!error) {
@@ -48,10 +55,14 @@ export async function retrieveChunksFromSupabase(input: RetrieveChunksInput): Pr
         content: row.content,
         section: row.section,
         sourceRef: row.source_ref,
+        documentId: row.document_id,
+        documentTitle: row.document_title,
+        pageStart: row.page_start,
+        pageEnd: row.page_end,
         brand: row.brand,
         model: row.model,
         productDomain: row.product_domain,
-        similarity: Number(row.similarity ?? 0)
+        similarity: Number(row.hybrid_score ?? row.similarity ?? 0)
       }));
     }
 

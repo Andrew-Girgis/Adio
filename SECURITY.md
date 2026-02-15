@@ -11,7 +11,7 @@ Primary concerns:
 ## Data Handling Policy
 - No raw microphone audio is persisted by this app.
 - No YouTube video/audio blobs are stored.
-- YouTube Guide Mode stores transcript text + structured procedure artifacts only.
+- YouTube Guide Mode stores transcript text + structured procedure artifacts only (shared cache by `videoId + language`).
 - Transcript/session persistence is optional and server-controlled.
 
 ## Implemented Mitigations
@@ -19,6 +19,7 @@ Primary concerns:
 - Procedure engine constrained command surface.
 - Clarifying-question behavior when transcript data is incomplete (no hallucinated steps).
 - Supabase service role key is server-only and never shipped to client.
+- n8n fallback auth uses server-side `Authorization: Bearer <N8N_API_TOKEN>`.
 - Local fallback mode preserves functionality if external services fail.
 
 ## Known Gaps (MVP)
