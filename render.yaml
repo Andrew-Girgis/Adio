@@ -1,0 +1,71 @@
+services:
+  # Backend API + WebSocket server
+  - type: web
+    name: adio-api
+    runtime: node
+    plan: free
+    buildCommand: corepack enable && NPM_CONFIG_PRODUCTION=false pnpm install --frozen-lockfile
+    startCommand: pnpm --filter @adio/server start
+    healthCheckPath: /health
+    envVars:
+      # Render provides PORT automatically; server falls back to SERVER_PORT locally.
+      - key: WEB_ORIGIN
+        value: "*"
+      - key: DEMO_MODE
+        value: "false"
+      - key: MANUALS_DIR
+        value: "./data/sample_manuals"
+      - key: SMALLEST_API_KEY
+        sync: false
+      - key: SMALLEST_VOICE_ID
+        value: "emily"
+      - key: SMALLEST_TTS_WS_URL
+        value: "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream"
+      - key: MAX_TTS_RETRIES
+        value: "2"
+      - key: TTS_STREAM_TIMEOUT_MS
+        value: "12000"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: EMBEDDINGS_PROVIDER
+        value: "openai"
+      - key: EMBEDDINGS_API_KEY
+        sync: false
+      - key: EMBEDDINGS_MODEL
+        value: "text-embedding-3-small"
+      - key: RAG_TOP_K
+        value: "4"
+      - key: YTDLP_PATH
+        value: "yt-dlp"
+      - key: YTDLP_TIMEOUT_MS
+        value: "25000"
+      - key: YOUTUBE_CAPTION_PREFERRED_LANG
+        value: "en"
+      - key: YOUTUBE_ENABLE_N8N_FALLBACK
+        value: "true"
+      - key: N8N_CAPTION_WEBHOOK_URL
+        sync: false
+      - key: N8N_API_TOKEN
+        sync: false
+      - key: LOG_LEVEL
+        value: "info"
+
+  # Frontend (Vite SPA)
+  - type: web
+    name: adio-web
+    runtime: static
+    plan: free
+    buildCommand: corepack enable && NPM_CONFIG_PRODUCTION=false pnpm install --frozen-lockfile && pnpm --filter @adio/web build
+    staticPublishPath: apps/web/dist
+    envVars:
+      # Update this if you rename the backend service or attach custom domains.
+      - key: VITE_SERVER_WS_URL
+        value: "wss://adio-api.onrender.com/ws"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

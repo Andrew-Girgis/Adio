@@ -80,11 +80,45 @@ label {
   font-size: 0.9rem;
 }
 
+.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox-row input {
+  width: 16px;
+  height: 16px;
+}
+
 input {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 10px 12px;
   font: inherit;
+}
+
+select,
+textarea {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 96px;
+}
+
+input[type="file"] {
+  padding: 8px;
+}
+
+.helper-copy {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 button {
@@ -157,6 +191,8 @@ button.secondary {
   display: flex;
   flex-direction: column;
   min-height: 560px;
+  position: relative;
+  overflow: hidden;
 }
 
 .transcript {
@@ -201,6 +237,56 @@ button.secondary {
   flex: 1;
 }
 
+.youtube-overlay {
+  position: absolute;
+  inset: 12px;
+  z-index: 20;
+  background: rgba(15, 20, 26, 0.56);
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(4px);
+}
+
+.youtube-overlay.hidden {
+  display: none;
+}
+
+.youtube-overlay-card {
+  width: min(420px, calc(100% - 24px));
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(16, 32, 49, 0.12);
+  border-radius: 14px;
+  padding: 18px 16px;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.22);
+}
+
+.youtube-overlay-card h3 {
+  margin: 0 0 8px;
+  font-size: 1rem;
+}
+
+.youtube-overlay-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.youtube-overlay.error .youtube-overlay-card {
+  border-color: rgba(159, 42, 31, 0.32);
+}
+
+.youtube-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 3px solid rgba(16, 32, 49, 0.14);
+  border-top-color: var(--accent);
+  margin-bottom: 10px;
+  animation: spin 0.8s linear infinite;
+}
+
 @keyframes fade-up {
   from {
     opacity: 0;
@@ -209,6 +295,15 @@ button.secondary {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 

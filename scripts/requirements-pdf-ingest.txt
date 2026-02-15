@@ -1,0 +1,5 @@
+pdfminer.six>=20231228
+openai>=1.58.1
+supabase>=2.11.0
+python-dotenv>=1.0.1
+tenacity>=9.0.0

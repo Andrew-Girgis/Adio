@@ -20,6 +20,13 @@
         <section class="panel controls">
           <h2>Session</h2>
           <label>
+            Mode
+            <select id="modeSelect">
+              <option value="manual" selected>Manual RAG Mode</option>
+              <option value="youtube">YouTube Guide Mode</option>
+            </select>
+          </label>
+          <label>
             Issue
             <input id="issueInput" placeholder="Dishwasher is not draining" value="Dishwasher is not draining" />
           </label>
@@ -27,6 +34,29 @@
             Model (optional)
             <input id="modelInput" placeholder="KDFE104HPS" />
           </label>
+          <label>
+            YouTube URL (optional)
+            <input id="youtubeUrlInput" placeholder="https://www.youtube.com/watch?v=..." />
+          </label>
+          <label>
+            Caption Language Preference
+            <input id="youtubeLangInput" placeholder="en" value="en" />
+          </label>
+          <label class="checkbox-row">
+            <input id="youtubeForceRefreshInput" type="checkbox" />
+            Force refresh captions (bypass cache)
+          </label>
+          <label>
+            Transcript Paste (.txt/.vtt/.srt)
+            <textarea id="transcriptInput" rows="5" placeholder="Paste transcript text here for YouTube Guide Mode"></textarea>
+          </label>
+          <label>
+            Transcript File (optional)
+            <input id="transcriptFileInput" type="file" accept=".txt,.vtt,.srt,text/plain" />
+          </label>
+          <p class="helper-copy">
+            Caption flow: cache -> yt-dlp -> n8n fallback -> manual transcript paste.
+          </p>
           <button id="startSessionBtn" class="primary">Start Voice Session</button>
 
           <div class="mic-row">
@@ -36,12 +66,14 @@
 
           <div class="status-block">
             <p><strong>Status:</strong> <span id="sessionStatus">Disconnected</span></p>
+            <p><strong>Phase:</strong> <span id="phaseLabel">Idle</span></p>
             <p><strong>Procedure:</strong> <span id="procedureLabel">-</span></p>
             <p><strong>Manual:</strong> <span id="manualLabel">-</span></p>
             <p><strong>Engine:</strong> <span id="engineLabel">-</span></p>
           </div>
 
           <div class="command-grid" id="commandGrid">
+            <button data-command="start">Ready / Start</button>
             <button data-command="stop">Stop</button>
             <button data-command="resume">Resume</button>
             <button data-command="repeat">Repeat</button>
@@ -59,6 +91,13 @@
         </section>
 
         <section class="panel transcript-panel">
+          <div id="youtubeOverlay" class="youtube-overlay hidden" aria-hidden="true">
+            <div class="youtube-overlay-card">
+              <div class="youtube-spinner" aria-hidden="true"></div>
+              <h3>YouTube Guide Loading</h3>
+              <p id="youtubeOverlayStage">Pulling transcript from YouTube...</p>
+            </div>
+          </div>
           <h2>Transcript</h2>
           <div id="transcript" class="transcript"></div>
 
