@@ -92,6 +92,8 @@ export class ManualService {
   }
 
   private async retrieveWithFallback(query: string, filters: RagFilters, topK: number): Promise<RagRetrievalResult> {
+    const wantsDocumentScope = Boolean(filters.documentIdFilter);
+
     if (this.supabase) {
       try {
         const chunks = await retrieveChunksFromSupabase({
@@ -102,17 +104,34 @@ export class ManualService {
           filters
         });
 
-        if (chunks.length > 0) {
+        if (chunks.length > 0 || wantsDocumentScope) {
           return {
             source: "supabase",
-            chunks
+            chunks,
+            warning: chunks.length === 0 && wantsDocumentScope ? "No chunks matched the selected appliance scope." : undefined
           };
         }
       } catch (error) {
         log.warn("supabase_retrieval_failed", {
           error: error instanceof Error ? error.message : String(error)
         });
+
+        if (wantsDocumentScope) {
+          return {
+            source: "supabase",
+            chunks: [],
+            warning: "Supabase retrieval failed for the selected appliance scope."
+          };
+        }
       }
+    }
+
+    if (wantsDocumentScope) {
+      return {
+        source: "local",
+        chunks: [],
+        warning: "Selected appliance scope requested, but Supabase is not available."
+      };
     }
 
     const localChunks = this.searchLocalChunks(query, filters, topK);

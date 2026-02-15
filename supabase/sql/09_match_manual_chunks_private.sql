@@ -1,3 +1,7 @@
+-- Extend manual retrieval RPC to support private uploaded manuals.
+-- Private manuals are excluded from global retrieval unless the caller scopes by document_id_filter
+-- and provides a matching document_access_token_hash.
+
 create or replace function public.match_manual_chunks(
   query_embedding vector(1536),
   query_text text default null,
@@ -6,6 +10,7 @@ create or replace function public.match_manual_chunks(
   brand_filter text default null,
   model_filter text default null,
   document_id_filter uuid default null,
+  document_access_token_hash text default null,
   candidate_count int default 120
 )
 returns table (
@@ -66,8 +71,22 @@ begin
       )
       and (document_id_filter is null or mc.document_id = document_id_filter)
       and (
+        -- Legacy/manual chunks without document association are always eligible.
         mc.document_id is null
-        or coalesce(md.is_active, false)
+        or (
+          -- Document-linked chunks must come from an active document.
+          coalesce(md.is_active, false)
+          and (
+            -- Public manuals are eligible globally.
+            coalesce(md.is_public, true)
+            -- Private manuals are eligible only when explicitly scoped with a matching token hash.
+            or (
+              document_id_filter is not null
+              and mc.document_id = document_id_filter
+              and md.access_token_hash = document_access_token_hash
+            )
+          )
+        )
       )
     order by mc.embedding <=> query_embedding asc
     limit greatest(candidate_count, match_count, 1)
@@ -94,3 +113,4 @@ begin
   limit greatest(match_count, 1);
 end;
 $$;
+

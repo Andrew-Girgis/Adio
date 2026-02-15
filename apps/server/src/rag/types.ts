@@ -4,6 +4,8 @@ export interface RagFilters {
   domainFilter?: ProductDomain | null;
   brandFilter?: string | null;
   modelFilter?: string | null;
+  documentIdFilter?: string | null;
+  documentAccessTokenHash?: string | null;
 }
 
 export interface RagRetrievedChunk {

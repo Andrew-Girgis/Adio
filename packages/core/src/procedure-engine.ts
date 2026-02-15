@@ -25,6 +25,49 @@ export class ProcedureEngine {
     };
   }
 
+  peekStep(stepNumber: number): { text: string; speechText: string } | null {
+    const total = this.procedure.steps.length;
+    if (stepNumber < 1 || stepNumber > total) {
+      return null;
+    }
+
+    const step = this.procedure.steps[stepNumber - 1];
+    if (!step) {
+      return null;
+    }
+
+    const safetyLine = this.buildSafetyLine(step);
+    const displaySafety = safetyLine ? `Safety: ${safetyLine}` : null;
+    const display = [`Step ${stepNumber} of ${total}: ${step.instruction}`, displaySafety].filter(Boolean).join(" ");
+    const speech = [`Step ${stepNumber}.`, step.instruction, displaySafety].filter(Boolean).join(" ");
+
+    return { text: display, speechText: speech };
+  }
+
+  goToStep(stepNumber: number): EngineResult {
+    const total = this.procedure.steps.length;
+    if (total === 0) {
+      this.status = "completed";
+      this.awaitingConfirmation = false;
+      return this.simpleResponse("Procedure has no steps.", "Procedure has no steps.");
+    }
+
+    if (!Number.isFinite(stepNumber) || stepNumber < 1 || stepNumber > total) {
+      return this.simpleResponse(
+        `That step number is out of range. This procedure has ${total} steps.`,
+        `Out of range. This procedure has ${total} steps.`
+      );
+    }
+
+    this.currentStepIndex = stepNumber - 1;
+    this.completedSteps = this.procedure.steps.slice(0, this.currentStepIndex).map((step) => step.id);
+    this.skipNeedsConfirmation = false;
+    this.status = "awaiting_confirmation";
+    this.awaitingConfirmation = true;
+
+    return this.renderCurrentStep();
+  }
+
   start(): EngineResult {
     if (this.procedure.steps.length === 0) {
       this.status = "completed";

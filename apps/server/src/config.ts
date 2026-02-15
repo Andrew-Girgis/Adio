@@ -106,7 +106,7 @@ export function loadConfig(): AppConfig {
     demoMode: parseBoolean(process.env.DEMO_MODE, true),
     manualsDir,
     smallestApiKey: process.env.SMALLEST_API_KEY,
-    smallestVoiceId: process.env.SMALLEST_VOICE_ID ?? "emily",
+    smallestVoiceId: process.env.SMALLEST_VOICE_ID ?? "sophia",
     smallestWsUrl: parseWsUrl(
       process.env.SMALLEST_TTS_WS_URL,
       "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream",

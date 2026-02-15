@@ -83,6 +83,10 @@ export interface StartSessionPayload {
   modelNumber?: string;
   demoMode?: boolean;
   mode?: "manual" | "youtube";
+  manualScope?: {
+    documentId: string;
+    accessToken: string;
+  };
   youtubeUrl?: string;
   transcriptText?: string;
   videoTitle?: string;
@@ -142,11 +146,18 @@ export interface RetrievalCitation {
   model: string | null;
 }
 
+export type AssistantMessageSource =
+  | "manual_procedure"
+  | "manual_rag"
+  | "youtube_procedure"
+  | "youtube_rag"
+  | "general";
+
 export type ServerWsMessage =
-	  | {
-	      type: "session.ready";
-	      payload: {
-	        sessionId: string;
+		  | {
+		      type: "session.ready";
+		      payload: {
+		        sessionId: string;
 	        demoMode: boolean;
 	        voice: {
 	          ttsProvider: string;
@@ -162,18 +173,38 @@ export type ServerWsMessage =
         state: ProcedureStateSnapshot;
       };
     }
-  | {
-      type: "assistant.message";
-      payload: {
-        text: string;
-        citations?: RetrievalCitation[];
-      };
-    }
-  | {
-      type: "rag.context";
-      payload: {
-        query: string;
-        source: "supabase" | "local";
+	  | {
+	      type: "assistant.message";
+	      payload: {
+	        text: string;
+	        source: AssistantMessageSource;
+	        citations?: RetrievalCitation[];
+	      };
+	    }
+	  | {
+	      type: "session.context";
+	      payload: {
+	        appliance?: {
+	          documentId: string | null;
+	          title: string;
+	          brand: string | null;
+	          model: string | null;
+	        };
+	        tools?: string[];
+	        ragScope?: {
+	          source: "supabase" | "local";
+	          documentId?: string | null;
+	          brand?: string | null;
+	          model?: string | null;
+	          domain?: "appliance" | "auto" | null;
+	        };
+	      };
+	    }
+	  | {
+	      type: "rag.context";
+	      payload: {
+	        query: string;
+	        source: "supabase" | "local";
         citations: RetrievalCitation[];
       };
     }

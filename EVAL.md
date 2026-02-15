@@ -32,6 +32,24 @@
 ### Completeness (10)
 - Monorepo scaffold, runnable app, docs, runbook, security notes.
 
+## Demo Beat Map (3-5 Minutes -> Rubric)
+Use this mapping to keep the demo deterministic and visibly tied to the scoring categories.
+
+| Demo beat | What the judge sees | Rubric categories |
+|---|---|---|
+| Problem statement | Why voice-first + step gating matters (hands-busy repairs) | Real-World Impact, Innovation, Demo & Presentation |
+| Start session | Live session actually starts (not slides) | Demo & Presentation, Completeness |
+| Sponsor voice path | Status shows smallest STT+TTS active (when configured) | Sponsor Integration, Voice AI Quality |
+| Interruption + recovery | `stop` mid-speech, then `resume` restores correct step | Voice AI Quality, Technical Execution |
+| Safety check | `safety check` returns risk-specific guidance | Innovation, Real-World Impact |
+| Completion | `confirm` progresses to a clean end state | Completeness, Technical Execution |
+| Metrics (optional) | `/debug` shows TTFA + stream metrics | Technical Execution |
+
+## Deterministic Demo Inputs
+- Manual Mode issue: `Dishwasher not draining (standing water)` (offline via `data/sample_manuals`)
+- YouTube Mode offline transcript fallback: `scripts/demo_youtube_sample.vtt`
+- Preflight smoke test: `node scripts/demo_smoke.mjs`
+
 ## Suggested Test Cases
 1. Start dishwasher flow and complete all steps via `confirm`.
 2. Interrupt assistant mid-speech with `stop`, then `resume`.

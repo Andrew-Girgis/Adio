@@ -8,6 +8,35 @@ Built for the AI Agents Waterloo Voice Hackathon with:
 - Supabase Postgres + pgvector RAG
 - YouTube Guide Mode (transcript -> compiled procedure)
 
+## Start Here (Judges)
+### 1) Run it locally
+```bash
+pnpm i
+cp .env.example .env
+pnpm dev
+```
+- Web: `http://localhost:5173`
+- Server health: `http://localhost:8787/health`
+- Server debug: `http://localhost:8787/debug`
+
+### 2) Preflight (deterministic, no mic required)
+Run the demo smoke test in a second terminal:
+```bash
+node scripts/demo_smoke.mjs
+```
+(`node` 20+ recommended for WebSocket support.)
+Optional YouTube Guide Mode preflight (offline transcript, no `yt-dlp` required):
+```bash
+node scripts/demo_smoke.mjs --mode youtube --transcript-file scripts/demo_youtube_sample.vtt
+```
+
+### 3) Deterministic live demo path (3-5 minutes)
+- Mode: **Manual**
+- Issue to paste: `Dishwasher not draining (standing water)`
+- Speak or type commands: `stop`, `resume`, `safety check`, `confirm`
+
+The strict judge-facing demo script + fallback plan live in `RUNBOOK.md`.
+
 ## Core Modes
 - Manual RAG Mode: local/sample manuals or Supabase vector retrieval.
 - YouTube Guide Mode: URL-first caption extraction (`cache -> yt-dlp -> n8n -> manual transcript`) compiles deterministic steps with timestamp citations.
@@ -62,7 +91,13 @@ Set these values in `.env`:
 ```bash
 DEMO_MODE=false
 SMALLEST_API_KEY=your_smallest_api_key
-SMALLEST_VOICE_ID=emily
+SMALLEST_VOICE_ID=sophia
+```
+
+To list available voices for your API key:
+```bash
+curl -s https://waves-api.smallest.ai/api/v1/lightning-v3.1/get_voices \\
+  -H "Authorization: Bearer $SMALLEST_API_KEY"
 ```
 
 What this enables:
@@ -88,6 +123,8 @@ Fallback behavior:
    - `supabase/sql/05_manual_documents.sql`
    - `supabase/sql/06_manual_chunks_pdf_fields.sql`
    - `supabase/sql/07_match_manual_chunks_hybrid.sql`
+   - `supabase/sql/08_manual_document_access.sql`
+   - `supabase/sql/09_match_manual_chunks_private.sql`
 3. Mandatory for hybrid retrieval:
    - `05` adds `manual_documents` used by active-document filtering in the retrieval RPC.
    - `06` adds `content_tsv`, document IDs, and page metadata used by hybrid ranking + citations.

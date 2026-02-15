@@ -41,6 +41,19 @@ export interface PulseProviderError extends Error {
   retryable: boolean;
 }
 
+export function isPulseProviderError(value: unknown): value is PulseProviderError {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      "code" in value &&
+      "provider" in value &&
+      "retryable" in value &&
+      typeof (value as { code?: unknown }).code === "string" &&
+      typeof (value as { provider?: unknown }).provider === "string" &&
+      typeof (value as { retryable?: unknown }).retryable === "boolean"
+  );
+}
+
 interface SmallestPulseProviderOptions {
   apiKey: string;
   wsUrl: string;
@@ -442,4 +455,3 @@ export class SmallestPulseProvider {
     }
   }
 }
-

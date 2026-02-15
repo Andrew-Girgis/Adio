@@ -35,6 +35,17 @@
             <input id="modelInput" placeholder="KDFE104HPS" />
           </label>
           <label>
+            Manual PDF (optional)
+            <input id="manualPdfInput" type="file" accept=".pdf,application/pdf" />
+          </label>
+          <div class="upload-status" id="manualUploadStatus" aria-live="polite">
+            <div class="upload-row">
+              <span id="manualUploadLabel">No manual uploaded</span>
+              <button id="manualClearBtn" class="secondary small" type="button" disabled>Clear</button>
+            </div>
+            <progress id="manualUploadProgress" value="0" max="100"></progress>
+          </div>
+          <label>
             YouTube URL (optional)
             <input id="youtubeUrlInput" placeholder="https://www.youtube.com/watch?v=..." />
           </label>
@@ -69,6 +80,8 @@
             <p><strong>Phase:</strong> <span id="phaseLabel">Idle</span></p>
             <p><strong>Procedure:</strong> <span id="procedureLabel">-</span></p>
             <p><strong>Manual:</strong> <span id="manualLabel">-</span></p>
+            <p><strong>Appliance:</strong> <span id="applianceLabel">-</span></p>
+            <p><strong>Tools:</strong> <span id="toolsLabel">-</span></p>
             <p><strong>Engine:</strong> <span id="engineLabel">-</span></p>
           </div>
 

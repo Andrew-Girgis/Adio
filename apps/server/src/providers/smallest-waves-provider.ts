@@ -258,14 +258,19 @@ export class SmallestWavesProvider implements StreamingTtsProvider {
         sampleRate: request.sampleRate
       });
 
-      const payload = {
-        voice_id: request.voiceId,
+      // `voice_id` appears to be account-specific; omit it when unset so the API can fall back to its default voice.
+      const payload: Record<string, unknown> = {
         text: request.text,
         sample_rate: request.sampleRate,
         add_wav_header: true,
         continue: false,
         flush: true
       };
+
+      const voiceId = request.voiceId.trim();
+      if (voiceId) {
+        payload.voice_id = voiceId;
+      }
 
       ws.send(JSON.stringify(payload));
     });
