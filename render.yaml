@@ -64,7 +64,7 @@ services:
     envVars:
       # Update this if you rename the backend service or attach custom domains.
       - key: VITE_SERVER_WS_URL
-        value: "wss://adio-api.onrender.com/ws"
+        value: "wss://adio-api-37pb.onrender.com/ws"
     routes:
       - type: rewrite
         source: /*
