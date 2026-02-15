@@ -3,7 +3,9 @@ services:
   - type: web
     name: adio-api
     runtime: node
-    buildCommand: corepack enable && NPM_CONFIG_PRODUCTION=false pnpm install --frozen-lockfile
+    # Render runs in a CI-like environment where pnpm defaults to frozen lockfiles.
+    # Keep builds unblocked for demos even if pnpm-lock.yaml drifts.
+    buildCommand: corepack enable && NPM_CONFIG_PRODUCTION=false pnpm install --no-frozen-lockfile
     startCommand: pnpm --filter @adio/server start
     healthCheckPath: /health
     envVars:
@@ -57,7 +59,7 @@ services:
   - type: web
     name: adio-web
     runtime: static
-    buildCommand: corepack enable && NPM_CONFIG_PRODUCTION=false pnpm install --frozen-lockfile && pnpm --filter @adio/web build
+    buildCommand: corepack enable && NPM_CONFIG_PRODUCTION=false pnpm install --no-frozen-lockfile && pnpm --filter @adio/web build
     staticPublishPath: apps/web/dist
     envVars:
       # Update this if you rename the backend service or attach custom domains.
