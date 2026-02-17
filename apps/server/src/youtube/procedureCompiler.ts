@@ -102,30 +102,106 @@ export function buildYoutubeOutputFromCompiled(input: BuildYoutubeOutputInput): 
 function extractTools(transcript: NormalizedTranscript): string[] {
   const tools = new Set<string>();
   const toolLinePattern = /\b(tools?|you(?:'|’)ll need|materials?|parts?)\b/i;
+  const introMarkerPattern = /\b(?:tools?|materials?|parts?|you(?:'|’)ll need)\b\s*[:\-]\s*/i;
+  const toolishKeywordPattern =
+    /\b(screwdriver|driver|pliers|wrench|socket|hammer|knife|putty|brush|vac|vacuum|flashlight|multimeter|gloves|goggles|glasses|towels|bucket|clamp|lubricant|soap|oil|torx|allen|hex)\b/i;
+  const refPattern = /\b(transcript|timestamp|chapter)\b/i;
+  const pageRefPattern = /\bp\d{1,4}\b/i;
+  const chunkRefPattern = /\bc\d{1,6}\b/i;
+  const timeRefPattern = /\b\d{1,2}:\d{2}\b/;
+  const numberishPattern = /^[0-9][0-9\s-]*$/;
+
+  const curatedMatchers: Array<{ name: string; pattern: RegExp }> = [
+    { name: "phillips screwdriver", pattern: /\bphillips\s+screwdriver\b/i },
+    { name: "flathead screwdriver", pattern: /\b(flathead|flat-head|slotted)\s+screwdriver\b/i },
+    { name: "torx driver", pattern: /\btorx\b/i },
+    { name: "nut driver", pattern: /\bnut\s+driver\b/i },
+    { name: "socket set", pattern: /\bsocket\s+set\b/i },
+    { name: "needle-nose pliers", pattern: /\bneedle\s*-?\s*nose\s+pliers\b/i },
+    { name: "pliers", pattern: /\bpliers\b/i },
+    { name: "adjustable wrench", pattern: /\b(adjustable|crescent)\s+wrench\b/i },
+    { name: "multimeter", pattern: /\bmultimeter\b/i },
+    { name: "flashlight", pattern: /\bflashlight\b/i },
+    { name: "bucket", pattern: /\bbucket\b/i },
+    { name: "towels", pattern: /\b(towel|towels|rag|rags)\b/i },
+    { name: "work gloves", pattern: /\b(gloves|work gloves)\b/i },
+    { name: "safety glasses", pattern: /\b(safety\s+glasses|eye protection)\b/i },
+    { name: "shop vac", pattern: /\b(shop\s*vac|wet\/?dry\s+vac)\b/i },
+    { name: "small brush", pattern: /\bbrush\b/i }
+  ];
+
+  const looksLikeRef = (text: string): boolean => {
+    return (
+      refPattern.test(text) ||
+      timeRefPattern.test(text) ||
+      pageRefPattern.test(text) ||
+      chunkRefPattern.test(text) ||
+      numberishPattern.test(text)
+    );
+  };
+
+  const sanitizeCandidate = (raw: string): string | null => {
+    const normalized = raw.replace(/[^a-z0-9\s-]/gi, " ").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+
+    if (looksLikeRef(normalized)) {
+      return null;
+    }
+
+    const words = normalized.split(" ").filter(Boolean);
+    if (words.length > 4) {
+      return null;
+    }
+
+    if (!toolishKeywordPattern.test(normalized)) {
+      return null;
+    }
+
+    if (normalized.length > 36) {
+      return null;
+    }
+
+    return normalized;
+  };
 
   for (const segment of transcript.segments) {
-    if (!toolLinePattern.test(segment.text)) {
+    const cleaned = segment.text.replace(/\s+/g, " ").trim();
+    if (!cleaned) {
       continue;
     }
 
-    const candidates = segment.text
-      .split(/[:,.;]|\band\b/gi)
+    for (const matcher of curatedMatchers) {
+      if (matcher.pattern.test(cleaned)) {
+        tools.add(matcher.name);
+      }
+    }
+
+    if (!toolLinePattern.test(cleaned)) {
+      continue;
+    }
+
+    const introMatch = cleaned.match(introMarkerPattern);
+    if (!introMatch || introMatch.index === undefined) {
+      continue;
+    }
+
+    const listText = cleaned.slice(introMatch.index + introMatch[0].length);
+    if (!listText) {
+      continue;
+    }
+
+    const candidates = listText
+      .split(/[;,]|\band\b/gi)
       .map((entry) => entry.trim().toLowerCase())
       .filter((entry) => entry.length >= 3);
 
     for (const candidate of candidates) {
-      if (
-        /\b(tool|tools|material|materials|need|you|will|this|that|then|step|parts?)\b/.test(candidate) &&
-        candidate.split(" ").length <= 2
-      ) {
-        continue;
+      const normalized = sanitizeCandidate(candidate);
+      if (normalized) {
+        tools.add(normalized);
       }
-
-      if (candidate.length > 36) {
-        continue;
-      }
-
-      tools.add(candidate.replace(/[^a-z0-9\s-]/g, "").trim());
     }
   }
 
@@ -157,14 +233,19 @@ function extractActionSteps(transcript: NormalizedTranscript): CompiledProcedure
 function toEngineProcedure(compiled: CompiledProcedureJson, video: VideoSourceMetadata): ProcedureDefinition {
   const steps: ProcedureStep[] = compiled.steps.map((step) => ({
     id: `video-step-${step.id}`,
-    instruction: `${step.instruction} (Timestamp ${step.timestamp_range})`,
+    instruction:
+      step.timestamp_range === "unknown" ? step.instruction : `${step.instruction} (Timestamp ${step.timestamp_range})`,
     requiresConfirmation: step.requires_confirmation,
     safetyCritical: step.safety_level === "high",
     safetyNotes:
       step.safety_level === "high"
-        ? `High-risk step from video transcript at ${step.timestamp_range}. Confirm area is safe before proceeding.`
+        ? step.timestamp_range === "unknown"
+          ? "High-risk step from video transcript. Confirm area is safe before proceeding."
+          : `High-risk step from video transcript at ${step.timestamp_range}. Confirm area is safe before proceeding.`
         : step.safety_level === "low"
-          ? `Use caution at ${step.timestamp_range}.`
+          ? step.timestamp_range === "unknown"
+            ? "Use caution during this step."
+            : `Use caution at ${step.timestamp_range}.`
           : undefined,
     explanation: step.notes ? `${step.notes} Transcript citation ${step.timestamp_range}: ${step.transcript_excerpt}` : undefined
   }));

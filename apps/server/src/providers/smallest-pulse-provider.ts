@@ -1,7 +1,8 @@
 import WebSocket, { type RawData } from "ws";
-import { createLogger } from "../utils/logger";
+import { createLogger, type LogLevel } from "../utils/logger";
 
-const log = createLogger("smallest-pulse");
+const logLevel = ((process.env.LOG_LEVEL as LogLevel | undefined) ?? "info") satisfies LogLevel;
+const log = createLogger("smallest-pulse", logLevel);
 
 export interface PulseTranscriptionRequest {
   streamId: string;
@@ -20,6 +21,13 @@ export type PulseSttEvent =
   | {
       type: "start";
       streamId: string;
+    }
+  | {
+      type: "debug";
+      streamId: string;
+      kind: "no_transcript_message";
+      keys: string[];
+      sample: string;
     }
   | {
       type: "transcript";
@@ -63,6 +71,8 @@ interface PulseMessageShape {
   status?: unknown;
   message?: unknown;
   transcript?: unknown;
+  text?: unknown;
+  transcription?: unknown;
   is_final?: unknown;
   isFinal?: unknown;
   final?: unknown;
@@ -70,6 +80,8 @@ interface PulseMessageShape {
     status?: unknown;
     message?: unknown;
     transcript?: unknown;
+    text?: unknown;
+    transcription?: unknown;
     is_final?: unknown;
     isFinal?: unknown;
     final?: unknown;
@@ -155,11 +167,11 @@ function booleanish(value: unknown): boolean | null {
 function extractTranscript(payload: PulseMessageShape): { text: string; isFinal: boolean } | null {
   const transcriptCandidates: Array<{ transcript: unknown; isFinal: unknown }> = [
     {
-      transcript: payload.transcript,
+      transcript: payload.transcript ?? payload.text ?? payload.transcription,
       isFinal: payload.is_final ?? payload.isFinal ?? payload.final
     },
     {
-      transcript: payload.data?.transcript,
+      transcript: payload.data?.transcript ?? payload.data?.text ?? payload.data?.transcription,
       isFinal: payload.data?.is_final ?? payload.data?.isFinal ?? payload.data?.final
     }
   ];
@@ -180,6 +192,19 @@ function extractTranscript(payload: PulseMessageShape): { text: string; isFinal:
   }
 
   return null;
+}
+
+function truncateJson(value: unknown, maxLength = 700): string {
+  let json: string;
+  try {
+    json = JSON.stringify(value);
+  } catch {
+    return "<unserializable>";
+  }
+  if (json.length <= maxLength) {
+    return json;
+  }
+  return `${json.slice(0, maxLength)}…`;
 }
 
 export class SmallestPulseProvider {
@@ -210,6 +235,7 @@ export class SmallestPulseProvider {
     let waiter: ((event: InternalEvent) => void) | null = null;
     let hasEnded = false;
     let timeoutHandle: NodeJS.Timeout | null = null;
+    let noTranscriptSampleCount = 0;
 
     const pushEvent = (event: InternalEvent): void => {
       if (waiter) {
@@ -336,6 +362,12 @@ export class SmallestPulseProvider {
         streamId: request.streamId
       });
       startAudioPump();
+
+      log.debug("pulse_ws_open", {
+        sessionId: request.sessionId,
+        streamId: request.streamId,
+        url: url.toString()
+      });
     });
 
     ws.on("message", (rawData) => {
@@ -382,6 +414,27 @@ export class SmallestPulseProvider {
           streamId: request.streamId,
           text: transcript.text,
           isFinal: transcript.isFinal
+        });
+        return;
+      }
+
+      if (logLevel === "debug" && noTranscriptSampleCount < 3) {
+        noTranscriptSampleCount += 1;
+        const keys = Object.keys(parsed as Record<string, unknown>);
+        const sample = truncateJson(parsed);
+        log.debug("pulse_message_no_transcript", {
+          sessionId: request.sessionId,
+          streamId: request.streamId,
+          keys,
+          sample
+        });
+
+        pushEvent({
+          type: "debug",
+          streamId: request.streamId,
+          kind: "no_transcript_message",
+          keys,
+          sample
         });
       }
     });

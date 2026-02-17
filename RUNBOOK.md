@@ -27,7 +27,8 @@ This section is written so anyone can run the same deterministic demo path in on
   - YouTube Mode fallback transcript file: `scripts/demo_youtube_sample.vtt`
 - If doing sponsor voice (smallest.ai)
   - `.env`: `DEMO_MODE=false`, `SMALLEST_API_KEY=...`
-  - In the UI status line, confirm it says `Ready (smallest STT+TTS)` before recording.
+  - Optional reliability mode: set `OPENAI_API_KEY=...` and `STT_PARALLEL_ENABLED=true`.
+  - In the UI status line, confirm it says `Ready (smallest STT+TTS)` or `Ready (parallel STT+TTS)` before recording.
 
 ### Strict Live Demo Script (3-5 minutes)
 Primary path is **Manual Mode** (no Supabase required, no YouTube required). This keeps the live demo deterministic.
@@ -39,7 +40,7 @@ Primary path is **Manual Mode** (no Supabase required, no YouTube required). Thi
 - In the UI: Mode = `Manual`.
 - Issue: `Dishwasher not draining (standing water)`.
 - Click `Start Voice Session`.
-- Point out the status line (sponsor path shows `Ready (smallest STT+TTS)`).
+- Point out the status line (sponsor path shows `Ready (smallest STT+TTS)` or `Ready (parallel STT+TTS)`).
 
 0:45 - 1:10 Tools gate (say this)
 - When asked about tools: say `Yes`.
@@ -75,7 +76,7 @@ Recovery (guaranteed):
 1. Switch to **Manual Mode**.
 2. Use issue `Dishwasher not draining (standing water)`.
 
-#### If smallest.ai provider degrades (TTS/STT stalls or errors)
+#### If voice providers degrade (TTS/STT stalls or errors)
 Symptoms:
 - Long silence after an assistant message, or repeated retries visible in logs.
 
@@ -88,7 +89,11 @@ Recovery (clean restart):
 2. If you need reliability over voice quality, set `.env` to force the built-in demo audio:
    - `DEMO_MODE=true`
    - (optional) clear `SMALLEST_API_KEY`
-3. Reload the page and re-run the manual-mode script.
+3. If STT was single-provider, enable parallel STT race:
+   - `OPENAI_API_KEY=...`
+   - `STT_PARALLEL_ENABLED=true`
+   - `STT_PROVIDER_ORDER=smallest-pulse,openai-realtime`
+4. Reload the page and re-run the manual-mode script.
 
 #### If the mic fails (permission, device, or browser issue)
 Symptoms:
@@ -130,6 +135,10 @@ curl -s https://waves-api.smallest.ai/api/v1/lightning-v3.1/get_voices \\
 Behavior:
 - Primary TTS is smallest.ai Waves only when `DEMO_MODE=false` and key is present.
 - If key is missing, server uses demo TTS even with `DEMO_MODE=false`.
+- STT provider selection:
+  - `STT_PARALLEL_ENABLED=true` + both STT keys => parallel race (`first non-empty final wins`).
+  - `STT_PARALLEL_ENABLED=false` => first provider in `STT_PROVIDER_ORDER`.
+  - no server STT keys => browser SpeechRecognition fallback.
 - Runtime smallest.ai failures retry up to `MAX_TTS_RETRIES`, then fall back to demo TTS.
 - Each smallest attempt respects `TTS_STREAM_TIMEOUT_MS` before retry/fallback.
 
@@ -156,6 +165,7 @@ Behavior:
    - `EMBEDDINGS_API_KEY`
    - `DEMO_MODE=false`
    - `SMALLEST_API_KEY`
+   - Optional STT parallel race: `OPENAI_API_KEY`, `STT_PARALLEL_ENABLED=true`
    - `YTDLP_PATH` and `YTDLP_TIMEOUT_MS`
    - Optional: `N8N_CAPTION_WEBHOOK_URL`, `N8N_API_TOKEN`, `YOUTUBE_ENABLE_N8N_FALLBACK=true`
 4. Ingest manuals:
@@ -219,6 +229,12 @@ Fix:
 - Check `tts_primary_failed` logs.
 - Verify fallback provider emits `tts.chunk`.
 
+### STT short-utterance failures
+- Check `/debug` for `sttDualFailureCount`, `sttRaceWins`, and `sttShortUtteranceSuccessRate`.
+- Confirm `OPENAI_API_KEY` is set and `STT_PARALLEL_ENABLED=true`.
+- Verify `STT_PROVIDER_ORDER` is valid (`smallest-pulse,openai-realtime`).
+- Watch server logs for `stt_provider_failed` and inspect `stt.metrics.loserReasons`.
+
 ### Fallback unexpectedly active
 - Verify `.env` has `DEMO_MODE=false` and valid `SMALLEST_API_KEY`.
 - Check `tts.status` / `tts.error` payloads and `/debug` `sessions[].lastTtsError`.
@@ -233,3 +249,5 @@ Recommended grep targets:
 - `rag_turn_warning`
 - `tts_primary_failed`
 - `tts_fallback_failed`
+- `stt_provider_failed`
+- `stt.metrics`

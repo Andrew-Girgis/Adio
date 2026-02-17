@@ -1,54 +1,12 @@
-import type { AssistantMessageSource, ClientWsMessage, RetrievalCitation, ServerWsMessage, VoiceCommand } from "@adio/core";
+import type {
+  AssistantMessageSource,
+  ClientWsMessage,
+  RetrievalCitation,
+  ServerWsMessage,
+  SttProvider,
+  VoiceCommand
+} from "@adio/core";
 import "./styles.css";
-
-interface SpeechRecognitionAlternative {
-  transcript: string;
-  confidence: number;
-}
-
-interface SpeechRecognitionResultLike {
-  isFinal: boolean;
-  length: number;
-  [index: number]: SpeechRecognitionAlternative;
-}
-
-interface SpeechRecognitionResultListLike {
-  length: number;
-  [index: number]: SpeechRecognitionResultLike;
-}
-
-interface SpeechRecognitionEventLike extends Event {
-  resultIndex: number;
-  results: SpeechRecognitionResultListLike;
-}
-
-interface SpeechRecognitionErrorEventLike extends Event {
-  error: string;
-}
-
-interface SpeechRecognitionLike extends EventTarget {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onstart: (() => void) | null;
-  onend: (() => void) | null;
-  onspeechstart: (() => void) | null;
-  onerror: ((event: SpeechRecognitionErrorEventLike) => void) | null;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  start(): void;
-  stop(): void;
-}
-
-interface SpeechRecognitionConstructor {
-  new (): SpeechRecognitionLike;
-}
-
-declare global {
-  interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  }
-}
 
 function must<T>(value: T | null, label: string): T {
   if (!value) {
@@ -57,10 +15,25 @@ function must<T>(value: T | null, label: string): T {
   return value;
 }
 
+interface StreamPlaybackState {
+  gain: GainNode;
+  startTime: number | null;
+  lastEndTime: number;
+  pendingChunks: number;
+  endRequested: boolean;
+  fadeInSec: number;
+  fadeOutSec: number;
+  fadeInScheduled: boolean;
+  fadeOutScheduled: boolean;
+  cleanupTimer: number | null;
+}
+
 class StreamingAudioQueue {
   private context: AudioContext | null = null;
   private nextStartTime = 0;
   private readonly activeSources = new Set<AudioBufferSourceNode>();
+  private readonly streamStates = new Map<string, StreamPlaybackState>();
+  private generation = 0;
 
   private getContext(): AudioContext {
     if (!this.context) {
@@ -132,24 +105,160 @@ class StreamingAudioQueue {
     }
   }
 
-  async enqueueWavBase64(base64Audio: string, sampleRateHint: number): Promise<void> {
+  beginStream(streamId: string, options?: { fadeMs?: number }): void {
     const ctx = this.getContext();
+    this.disposeStream(streamId);
+
+    const fadeMs = options?.fadeMs ?? 10;
+    const fadeSec = Math.max(0, fadeMs / 1000);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, ctx.currentTime);
+    gain.connect(ctx.destination);
+
+    this.streamStates.set(streamId, {
+      gain,
+      startTime: null,
+      lastEndTime: 0,
+      pendingChunks: 0,
+      endRequested: false,
+      fadeInSec: fadeSec,
+      fadeOutSec: fadeSec,
+      fadeInScheduled: false,
+      fadeOutScheduled: false,
+      cleanupTimer: null
+    });
+  }
+
+  endStream(streamId: string): void {
+    const state = this.streamStates.get(streamId);
+    if (!state) {
+      return;
+    }
+    state.endRequested = true;
+    this.tryFinalizeStream(streamId, state);
+  }
+
+  private ensureStream(streamId: string): StreamPlaybackState {
+    const existing = this.streamStates.get(streamId);
+    if (existing) {
+      return existing;
+    }
+    this.beginStream(streamId);
+    return this.streamStates.get(streamId) as StreamPlaybackState;
+  }
+
+  private disposeStream(streamId: string): void {
+    const state = this.streamStates.get(streamId);
+    if (!state) {
+      return;
+    }
+
+    if (state.cleanupTimer !== null) {
+      clearTimeout(state.cleanupTimer);
+    }
+
+    try {
+      state.gain.disconnect();
+    } catch {
+      // ignore
+    }
+
+    this.streamStates.delete(streamId);
+  }
+
+  private scheduleFadeIn(state: StreamPlaybackState, startAt: number): void {
+    if (state.fadeInScheduled || state.fadeInSec <= 0) {
+      return;
+    }
+
+    state.fadeInScheduled = true;
+    const gainParam = state.gain.gain;
+    gainParam.cancelScheduledValues(startAt);
+    gainParam.setValueAtTime(0, startAt);
+    gainParam.linearRampToValueAtTime(1, startAt + state.fadeInSec);
+  }
+
+  private tryFinalizeStream(streamId: string, state: StreamPlaybackState): void {
+    if (!state.endRequested || state.pendingChunks > 0 || state.fadeOutScheduled) {
+      return;
+    }
+
+    const ctx = this.context;
+    if (!ctx || state.startTime === null) {
+      this.disposeStream(streamId);
+      return;
+    }
+
+    const endTime = state.lastEndTime;
+    if (!Number.isFinite(endTime) || endTime <= ctx.currentTime) {
+      this.disposeStream(streamId);
+      return;
+    }
+
+    state.fadeOutScheduled = true;
+
+    const fadeOutSec = Math.max(0.001, Math.min(state.fadeOutSec, endTime - state.startTime));
+    const fadeInEnd = state.startTime + state.fadeInSec;
+    let fadeStart = Math.max(state.startTime, endTime - fadeOutSec);
+    if (fadeStart < fadeInEnd) {
+      fadeStart = fadeInEnd;
+    }
+    if (fadeStart >= endTime) {
+      fadeStart = Math.max(state.startTime, endTime - 0.001);
+    }
+
+    const gainParam = state.gain.gain;
+    gainParam.cancelScheduledValues(fadeStart);
+    gainParam.setValueAtTime(1, fadeStart);
+    gainParam.linearRampToValueAtTime(0, endTime);
+
+    if (state.cleanupTimer !== null) {
+      clearTimeout(state.cleanupTimer);
+    }
+    const delayMs = Math.max(0, Math.ceil((endTime - ctx.currentTime + 0.05) * 1000));
+    state.cleanupTimer = window.setTimeout(() => {
+      this.disposeStream(streamId);
+    }, delayMs);
+  }
+
+  async enqueueWavBase64(streamId: string, base64Audio: string, sampleRateHint: number): Promise<void> {
+    const ctx = this.getContext();
+    const state = this.ensureStream(streamId);
+    const generation = this.generation;
+    state.pendingChunks += 1;
     const bytes = this.decodeBase64(base64Audio);
-    const audioBuffer = await this.decodeAudioWithFallback(bytes, sampleRateHint);
+    try {
+      const audioBuffer = await this.decodeAudioWithFallback(bytes, sampleRateHint);
+      if (generation !== this.generation) {
+        return;
+      }
 
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(ctx.destination);
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(state.gain);
 
-    const startAt = Math.max(ctx.currentTime + 0.012, this.nextStartTime);
-    this.nextStartTime = startAt + audioBuffer.duration;
+      const startAt = Math.max(ctx.currentTime + 0.012, this.nextStartTime);
+      this.nextStartTime = startAt + audioBuffer.duration;
 
-    source.onended = () => {
-      this.activeSources.delete(source);
-    };
+      if (state.startTime === null) {
+        state.startTime = startAt;
+        this.scheduleFadeIn(state, startAt);
+      }
+      state.lastEndTime = startAt + audioBuffer.duration;
 
-    this.activeSources.add(source);
-    source.start(startAt);
+      source.onended = () => {
+        this.activeSources.delete(source);
+      };
+
+      this.activeSources.add(source);
+      source.start(startAt);
+    } finally {
+      state.pendingChunks = Math.max(0, state.pendingChunks - 1);
+      if (state.endRequested) {
+        this.tryFinalizeStream(streamId, state);
+      }
+    }
   }
 
   stopAll(): void {
@@ -157,6 +266,8 @@ class StreamingAudioQueue {
     if (!ctx) {
       return;
     }
+
+    this.generation += 1;
 
     for (const source of this.activeSources) {
       try {
@@ -167,12 +278,14 @@ class StreamingAudioQueue {
     }
 
     this.activeSources.clear();
+    for (const streamId of this.streamStates.keys()) {
+      this.disposeStream(streamId);
+    }
     this.nextStartTime = ctx.currentTime;
   }
 }
 
-type SttProvider = "smallest-pulse" | "browser-speech";
-type MicMode = "server-stt" | "browser-speech";
+type MicMode = "server-stt";
 
 const STT_TARGET_SAMPLE_RATE = 16000;
 const STT_TARGET_ENCODING = "linear16";
@@ -236,15 +349,52 @@ class ServerSttMic {
   private processor: ScriptProcessorNode | null = null;
   private zeroGain: GainNode | null = null;
 
+  private ready = false;
+  private readyPromise: Promise<void> | null = null;
+  private readyResolve: (() => void) | null = null;
+
   private utteranceActive = false;
+  private manualUtteranceActive = false;
   private utteranceStartedAtMs: number | null = null;
+  private pendingEndAtMs: number | null = null;
   private silenceFrames = 0;
   private preroll: ArrayBuffer[] = [];
+  private lastPcmByteLength = 0;
 
-  private readonly vadThreshold = 0.015;
-  private readonly silenceFramesToEnd = 10;
-  private readonly prerollFrames = 3;
+  private noiseFloor = 0;
+  private noiseFrames = 0;
+  private speechStartFrames = 0;
+  private utteranceThreshold = 0.015;
+  private utteranceEnergySum = 0;
+  private utteranceEnergyCount = 0;
+  private utteranceMaxEnergy = 0;
+
+  private readonly minThreshold = 0.004;
+  private readonly maxThreshold = 0.05;
+  private readonly thresholdMultiplier = 2.5;
+  private readonly speechStartFramesRequired = 1;
+  private readonly silenceMultiplier = 0.75;
+
+  private readonly silenceFramesToEnd = 20;
+  private readonly prerollFrames = 6;
   private readonly maxUtteranceMs = 12_000;
+  private readonly minUtteranceMs = 650;
+  private readonly postSilenceHangoverMs = 250;
+
+  private utteranceBytesSent = 0;
+  private utteranceChunksSent = 0;
+  private utteranceKind: "vad" | "ptt" | null = null;
+  private lastUtteranceStats: {
+    kind: "vad" | "ptt";
+    startedAtMs: number;
+    endedAtMs: number;
+    bytesSent: number;
+    chunksSent: number;
+    threshold: number;
+    noiseFloor: number;
+    maxEnergy: number;
+    avgEnergy: number;
+  } | null = null;
 
   constructor(
     private readonly sendControl: (message: ClientWsMessage) => void,
@@ -258,22 +408,201 @@ class ServerSttMic {
     return Boolean(this.mediaStream);
   }
 
+  getLastUtteranceStats(): typeof this.lastUtteranceStats {
+    return this.lastUtteranceStats;
+  }
+
+  getDebugSnapshot(): { utteranceActive: boolean; manualUtteranceActive: boolean; noiseFloor: number; threshold: number } {
+    return {
+      utteranceActive: this.utteranceActive,
+      manualUtteranceActive: this.manualUtteranceActive,
+      noiseFloor: this.noiseFloor,
+      threshold: this.utteranceThreshold
+    };
+  }
+
+  async awaitReady(timeoutMs: number): Promise<boolean> {
+    if (this.ready) {
+      return true;
+    }
+    if (!this.readyPromise) {
+      return false;
+    }
+    const ready = this.readyPromise.then(() => true);
+    const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), Math.max(0, timeoutMs)));
+    return await Promise.race([ready, timeout]);
+  }
+
+  beginManualUtterance(): void {
+    if (!this.mediaStream) {
+      throw new Error("Mic not started.");
+    }
+    if (this.utteranceActive) {
+      this.manualUtteranceActive = true;
+      this.utteranceKind = this.utteranceKind ?? "ptt";
+      return;
+    }
+
+    this.manualUtteranceActive = true;
+    this.startUtterance("ptt");
+  }
+
+  endManualUtterance(reason: "ptt_release" | "ptt_cancel" = "ptt_release"): void {
+    this.manualUtteranceActive = false;
+    if (!this.utteranceActive) {
+      return;
+    }
+    this.endUtterance(reason);
+  }
+
+  private sendBinaryTracked(chunk: ArrayBuffer): void {
+    this.utteranceChunksSent += 1;
+    this.utteranceBytesSent += chunk.byteLength;
+    if (this.utteranceChunksSent <= 3) {
+      dlog("stt.audio.chunk", { n: this.utteranceChunksSent, bytes: chunk.byteLength, transport: sttTransportMode });
+    }
+    this.sendBinary(chunk);
+  }
+
+  private trackUtteranceEnergy(energy: number): void {
+    if (!this.utteranceActive) {
+      return;
+    }
+    this.utteranceEnergySum += energy;
+    this.utteranceEnergyCount += 1;
+    if (energy > this.utteranceMaxEnergy) {
+      this.utteranceMaxEnergy = energy;
+    }
+  }
+
+  private startUtterance(kind: "vad" | "ptt", thresholdOverride?: number): void {
+    this.utteranceActive = true;
+    this.utteranceKind = kind;
+    this.utteranceStartedAtMs = performance.now();
+    this.pendingEndAtMs = null;
+    this.silenceFrames = 0;
+    this.speechStartFrames = 0;
+    this.utteranceBytesSent = 0;
+    this.utteranceChunksSent = 0;
+    this.utteranceEnergySum = 0;
+    this.utteranceEnergyCount = 0;
+    this.utteranceMaxEnergy = 0;
+
+    // Freeze a reasonable per-utterance silence threshold (noise-floor based).
+    const threshold =
+      thresholdOverride ?? Math.min(this.maxThreshold, Math.max(this.minThreshold, this.noiseFloor * this.thresholdMultiplier));
+    this.utteranceThreshold = threshold;
+
+    this.onSpeechStart();
+    dlog("stt.audio.start", {
+      kind,
+      transport: sttTransportMode,
+      encoding: STT_TARGET_ENCODING,
+      sampleRate: STT_TARGET_SAMPLE_RATE,
+      language: this.language,
+      threshold
+    });
+    this.sendControl({
+      type: "audio.start",
+      payload: {
+        encoding: STT_TARGET_ENCODING,
+        sampleRate: STT_TARGET_SAMPLE_RATE,
+        language: this.language
+      }
+    });
+
+    for (const chunk of this.preroll) {
+      this.sendBinaryTracked(chunk);
+    }
+    this.preroll = [];
+  }
+
+  private endUtterance(reason: string): void {
+    const startedAt = this.utteranceStartedAtMs ?? performance.now();
+    const endedAt = performance.now();
+    const kind = this.utteranceKind ?? "vad";
+    const avgEnergy = this.utteranceEnergyCount > 0 ? this.utteranceEnergySum / this.utteranceEnergyCount : 0;
+
+    this.lastUtteranceStats = {
+      kind,
+      startedAtMs: startedAt,
+      endedAtMs: endedAt,
+      bytesSent: this.utteranceBytesSent,
+      chunksSent: this.utteranceChunksSent,
+      threshold: this.utteranceThreshold,
+      noiseFloor: this.noiseFloor,
+      maxEnergy: this.utteranceMaxEnergy,
+      avgEnergy
+    };
+
+    this.utteranceActive = false;
+    this.utteranceKind = null;
+    this.utteranceStartedAtMs = null;
+    this.pendingEndAtMs = null;
+    this.silenceFrames = 0;
+    this.speechStartFrames = 0;
+    this.preroll = [];
+    this.onSpeechEnd();
+
+    // Pulse sometimes fails to flush very short utterances if we cut off abruptly (mic stop / PTT release).
+    // Pad a small amount of trailing silence to help end-of-utterance detection server-side.
+    if (reason === "mic_stop" || reason.startsWith("ptt_")) {
+      const pcmBytes = this.lastPcmByteLength || 0;
+      if (pcmBytes > 0) {
+        const paddingChunks = 6; // ~250ms at 2048/48kHz ScriptProcessor frames
+        const silent = new ArrayBuffer(pcmBytes);
+        for (let i = 0; i < paddingChunks; i += 1) {
+          this.sendBinaryTracked(silent);
+        }
+      }
+    }
+
+    dlog("stt.audio.end", {
+      kind,
+      transport: sttTransportMode,
+      reason,
+      bytesSent: this.utteranceBytesSent,
+      chunksSent: this.utteranceChunksSent
+    });
+    this.sendControl({
+      type: "audio.end",
+      payload: {
+        reason
+      }
+    });
+  }
+
   async start(): Promise<void> {
     if (this.mediaStream) {
       return;
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
+    this.ready = false;
+    this.readyPromise = new Promise<void>((resolve) => {
+      this.readyResolve = resolve;
     });
 
-    const audioContext = new AudioContext();
-    await audioContext.resume();
+	    const stream = await navigator.mediaDevices.getUserMedia({
+	      audio: {
+	        channelCount: 1,
+	        echoCancellation: true,
+	        noiseSuppression: true,
+	        autoGainControl: true
+	      }
+	    });
+	    dlog("mic.getUserMedia.ok");
+	    const track = stream.getAudioTracks()[0];
+	    if (track) {
+	      dlog("mic.track", {
+	        label: track.label,
+	        settings: track.getSettings?.() ?? null,
+	        constraints: track.getConstraints?.() ?? null
+	      });
+	    }
+
+	    const audioContext = new AudioContext();
+	    await audioContext.resume();
+	    dlog("mic.audioContext.ready", { state: audioContext.state, sampleRate: audioContext.sampleRate });
 
     const source = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(2048, 1, 1);
@@ -284,6 +613,25 @@ class ServerSttMic {
       const input = event.inputBuffer.getChannelData(0);
       const energy = rmsEnergy(input);
       const pcm16 = downsampleToPcm16LE(input, audioContext.sampleRate, STT_TARGET_SAMPLE_RATE);
+      this.lastPcmByteLength = pcm16.byteLength;
+
+      if (!this.ready) {
+        this.ready = true;
+        if (this.readyResolve) {
+          this.readyResolve();
+          this.readyResolve = null;
+        }
+        dlog("mic.audio_process.first", { pcmBytes: pcm16.byteLength, sampleRate: audioContext.sampleRate, energy });
+      }
+
+      if (this.manualUtteranceActive) {
+        if (!this.utteranceActive) {
+          this.startUtterance("ptt");
+        }
+        this.trackUtteranceEnergy(energy);
+        this.sendBinaryTracked(pcm16);
+        return;
+      }
 
       if (!this.utteranceActive) {
         this.preroll.push(pcm16);
@@ -291,65 +639,56 @@ class ServerSttMic {
           this.preroll.shift();
         }
 
-        if (energy > this.vadThreshold) {
-          this.utteranceActive = true;
-          this.utteranceStartedAtMs = performance.now();
-          this.silenceFrames = 0;
-          this.onSpeechStart();
+        const threshold = Math.min(this.maxThreshold, Math.max(this.minThreshold, this.noiseFloor * this.thresholdMultiplier));
+        // Only learn the noise floor when the signal is below the current threshold.
+        if (energy <= threshold) {
+          this.noiseFloor = this.noiseFrames === 0 ? energy : this.noiseFloor * 0.95 + energy * 0.05;
+          this.noiseFrames += 1;
+        }
 
-          this.sendControl({
-            type: "audio.start",
-            payload: {
-              encoding: STT_TARGET_ENCODING,
-              sampleRate: STT_TARGET_SAMPLE_RATE,
-              language: this.language
-            }
-          });
+        if (energy > threshold) {
+          this.speechStartFrames += 1;
+        } else {
+          this.speechStartFrames = 0;
+        }
 
-          for (const chunk of this.preroll) {
-            this.sendBinary(chunk);
-          }
-          this.preroll = [];
+        if (this.speechStartFrames >= this.speechStartFramesRequired) {
+          this.startUtterance("vad", threshold);
         }
 
         return;
       }
 
-      this.sendBinary(pcm16);
+      this.trackUtteranceEnergy(energy);
+      this.sendBinaryTracked(pcm16);
 
       if (this.utteranceStartedAtMs !== null && performance.now() - this.utteranceStartedAtMs >= this.maxUtteranceMs) {
-        this.utteranceActive = false;
-        this.utteranceStartedAtMs = null;
-        this.silenceFrames = 0;
-        this.preroll = [];
-        this.onSpeechEnd();
-        this.sendControl({
-          type: "audio.end",
-          payload: {
-            reason: "max_duration"
-          }
-        });
+        this.endUtterance("max_duration");
         return;
       }
 
-      if (energy <= this.vadThreshold) {
+      if (energy <= this.utteranceThreshold * this.silenceMultiplier) {
         this.silenceFrames += 1;
       } else {
         this.silenceFrames = 0;
+        this.pendingEndAtMs = null;
       }
 
       if (this.silenceFrames >= this.silenceFramesToEnd) {
-        this.utteranceActive = false;
-        this.utteranceStartedAtMs = null;
-        this.silenceFrames = 0;
-        this.preroll = [];
-        this.onSpeechEnd();
-        this.sendControl({
-          type: "audio.end",
-          payload: {
-            reason: "silence"
-          }
-        });
+        const now = performance.now();
+        if (this.pendingEndAtMs === null) {
+          this.pendingEndAtMs = now + this.postSilenceHangoverMs;
+        }
+        if (now < this.pendingEndAtMs) {
+          return;
+        }
+        if (this.utteranceStartedAtMs !== null && now - this.utteranceStartedAtMs < this.minUtteranceMs) {
+          return;
+        }
+        // Still silent after hangover + min duration window; commit the utterance.
+        if (energy <= this.utteranceThreshold * this.silenceMultiplier) {
+          this.endUtterance("silence");
+        }
       }
     };
 
@@ -369,22 +708,23 @@ class ServerSttMic {
       return;
     }
 
+    this.manualUtteranceActive = false;
     if (this.utteranceActive) {
-      this.utteranceActive = false;
-      this.utteranceStartedAtMs = null;
-      this.silenceFrames = 0;
-      this.preroll = [];
-      this.onSpeechEnd();
-      this.sendControl({
-        type: "audio.end",
-        payload: {
-          reason: "mic_stop"
-        }
-      });
+      this.endUtterance("mic_stop");
     }
+
+    this.silenceFrames = 0;
+    this.speechStartFrames = 0;
+    this.preroll = [];
+    this.noiseFloor = 0;
+    this.noiseFrames = 0;
 
     this.mediaStream.getTracks().forEach((track) => track.stop());
     this.mediaStream = null;
+
+    this.ready = false;
+    this.readyPromise = null;
+    this.readyResolve = null;
 
     try {
       this.source?.disconnect();
@@ -419,11 +759,6 @@ const manualUploadProgress = must(document.querySelector<HTMLProgressElement>("#
 const manualClearBtn = must(document.querySelector<HTMLButtonElement>("#manualClearBtn"), "manualClearBtn");
 const modeSelect = must(document.querySelector<HTMLSelectElement>("#modeSelect"), "modeSelect");
 const youtubeUrlInput = must(document.querySelector<HTMLInputElement>("#youtubeUrlInput"), "youtubeUrlInput");
-const youtubeLangInput = must(document.querySelector<HTMLInputElement>("#youtubeLangInput"), "youtubeLangInput");
-const youtubeForceRefreshInput = must(
-  document.querySelector<HTMLInputElement>("#youtubeForceRefreshInput"),
-  "youtubeForceRefreshInput"
-);
 const transcriptInput = must(document.querySelector<HTMLTextAreaElement>("#transcriptInput"), "transcriptInput");
 const transcriptFileInput = must(
   document.querySelector<HTMLInputElement>("#transcriptFileInput"),
@@ -431,6 +766,7 @@ const transcriptFileInput = must(
 );
 const startSessionBtn = must(document.querySelector<HTMLButtonElement>("#startSessionBtn"), "startSessionBtn");
 const micBtn = must(document.querySelector<HTMLButtonElement>("#micBtn"), "micBtn");
+const pttBtn = must(document.querySelector<HTMLButtonElement>("#pttBtn"), "pttBtn");
 const micStatus = must(document.querySelector<HTMLSpanElement>("#micStatus"), "micStatus");
 const sessionStatus = must(document.querySelector<HTMLSpanElement>("#sessionStatus"), "sessionStatus");
 const phaseLabel = must(document.querySelector<HTMLSpanElement>("#phaseLabel"), "phaseLabel");
@@ -444,23 +780,56 @@ const typedForm = must(document.querySelector<HTMLFormElement>("#typedForm"), "t
 const typedInput = must(document.querySelector<HTMLInputElement>("#typedInput"), "typedInput");
 const commandGrid = must(document.querySelector<HTMLDivElement>("#commandGrid"), "commandGrid");
 const metricsOutput = must(document.querySelector<HTMLPreElement>("#metricsOutput"), "metricsOutput");
+const debugLogsToggle = must(document.querySelector<HTMLInputElement>("#debugLogsToggle"), "debugLogsToggle");
 const youtubeOverlay = must(document.querySelector<HTMLDivElement>("#youtubeOverlay"), "youtubeOverlay");
 const youtubeOverlayStage = must(document.querySelector<HTMLParagraphElement>("#youtubeOverlayStage"), "youtubeOverlayStage");
 
 const audioQueue = new StreamingAudioQueue();
 const wsUrl = import.meta.env.VITE_SERVER_WS_URL ?? "ws://localhost:8787/ws";
+const debugParams = new URLSearchParams(window.location.search);
+const debugPref = localStorage.getItem("adio_debug");
+const debugEnabled = debugParams.has("debug") || debugPref === "1" || (import.meta.env.DEV && debugPref !== "0");
+
+debugLogsToggle.checked = debugEnabled;
+debugLogsToggle.addEventListener("change", () => {
+  localStorage.setItem("adio_debug", debugLogsToggle.checked ? "1" : "0");
+  window.location.reload();
+});
+
+function dlog(message: string, detail?: Record<string, unknown>): void {
+  if (!debugEnabled) {
+    return;
+  }
+  if (detail) {
+    console.log("[adio voice]", message, detail);
+    return;
+  }
+  console.log("[adio voice]", message);
+}
+
+function derr(message: string, detail?: Record<string, unknown>): void {
+  if (detail) {
+    console.error("[adio voice]", message, detail);
+    return;
+  }
+  console.error("[adio voice]", message);
+}
 type ManualScope = { documentId: string; accessToken: string };
 type ManualUploadJobStatus = "stored" | "parsing" | "chunking" | "embedding" | "writing" | "ready" | "failed";
 let uploadedManualScope: ManualScope | null = null;
 let uploadedManualJobId: string | null = null;
 let uploadedManualFileKey: string | null = null;
 let socket: WebSocket | null = null;
-let recognition: SpeechRecognitionLike | null = null;
 let micActive = false;
 let micDesired = false;
-let sttProvider: SttProvider = "browser-speech";
-let micMode: MicMode = "browser-speech";
+let sttProvider: SttProvider = "parallel";
+let micMode: MicMode = "server-stt";
+let sttTransportMode: "binary" | "base64" = "binary";
 let serverMic: ServerSttMic | null = null;
+let sttFailureWindow: number[] = [];
+let lastSttErrorCode: string | null = null;
+let lastSttMetrics: Record<string, unknown> | null = null;
+let lastUtteranceClientStats: Record<string, unknown> | null = null;
 let partialMessageNode: HTMLDivElement | null = null;
 let activeMode: "manual" | "youtube" = "manual";
 let awaitingYoutubeGreeting = false;
@@ -468,6 +837,41 @@ let lastYoutubeStage: "extracting_transcript" | "compiling_guide" | "preparing_v
 let decodeFailureCount = 0;
 let decodeFallbackAnnounced = false;
 const streamSampleRates = new Map<string, number>();
+let metricsView: unknown = "No stream metrics yet.";
+
+function renderMetricsOutput(): void {
+  const debug = {
+    debugEnabled,
+    micMode,
+    sttProvider,
+    sttTransportMode,
+    lastSttErrorCode,
+    lastUtteranceClientStats,
+    lastSttMetrics
+  };
+
+  if (typeof metricsView === "string") {
+    metricsOutput.textContent = metricsView;
+    if (debugEnabled) {
+      metricsOutput.textContent += `\n\n[debug]\n${JSON.stringify(debug, null, 2)}`;
+    }
+    return;
+  }
+
+  metricsOutput.textContent = JSON.stringify(
+    {
+      view: metricsView,
+      debug
+    },
+    null,
+    2
+  );
+}
+
+function setMetricsView(view: unknown): void {
+  metricsView = view;
+  renderMetricsOutput();
+}
 
 type UiPhase = "idle" | "listening" | "thinking" | "speaking" | "error";
 let uiPhase: UiPhase = "idle";
@@ -528,6 +932,27 @@ function hideYoutubeOverlay(): void {
 
 function setStatus(value: string): void {
   sessionStatus.textContent = value;
+}
+
+function micIdleText(): string {
+  return "Mic idle (server STT)";
+}
+
+function isServerSttProvider(provider: SttProvider): boolean {
+  return provider === "smallest-pulse" || provider === "openai-realtime" || provider === "parallel";
+}
+
+function sttReadyStatus(provider: SttProvider): string {
+  if (provider === "parallel") {
+    return "Ready (parallel STT+TTS)";
+  }
+  if (provider === "smallest-pulse") {
+    return "Ready (smallest STT+TTS)";
+  }
+  if (provider === "openai-realtime") {
+    return "Ready (OpenAI STT+TTS)";
+  }
+  return "Ready";
 }
 
 function sleep(ms: number): Promise<void> {
@@ -647,6 +1072,16 @@ function safeJsonParse(text: string): unknown | null {
   }
 }
 
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 function appendTranscript(text: string, role: "user" | "assistant" | "partial"): void {
   if (role === "partial") {
     if (!partialMessageNode) {
@@ -738,6 +1173,9 @@ function sendMessage(message: ClientWsMessage): void {
     return;
   }
 
+  if (message.type !== "audio.chunk") {
+    dlog("ws.send", { type: message.type });
+  }
   socket.send(JSON.stringify(message));
 }
 
@@ -748,20 +1186,16 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
 
   const sampleRate = streamSampleRates.get(streamId) ?? 24000;
   try {
-    await audioQueue.enqueueWavBase64(chunkBase64, sampleRate);
+    await audioQueue.enqueueWavBase64(streamId, chunkBase64, sampleRate);
     decodeFailureCount = 0;
   } catch (error) {
     decodeFailureCount += 1;
     const detail = error instanceof Error ? error.message : String(error);
-    metricsOutput.textContent = JSON.stringify(
-      {
-        audioDecodeFailureCount: decodeFailureCount,
-        streamId,
-        detail
-      },
-      null,
-      2
-    );
+    setMetricsView({
+      audioDecodeFailureCount: decodeFailureCount,
+      streamId,
+      detail
+    });
 
     if (decodeFailureCount >= 3 && !decodeFallbackAnnounced) {
       decodeFallbackAnnounced = true;
@@ -787,11 +1221,33 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
 	function handleServerMessage(message: ServerWsMessage): void {
 	  switch (message.type) {
 	    case "session.ready":
-	      sttProvider = message.payload.voice?.sttProvider ?? "browser-speech";
-	      micMode =
-	        sttProvider === "smallest-pulse" && Boolean(navigator.mediaDevices?.getUserMedia) ? "server-stt" : "browser-speech";
+	      sttProvider = message.payload.voice?.sttProvider ?? "parallel";
+	      micMode = "server-stt";
+        const supportsServerMic = Boolean(navigator.mediaDevices?.getUserMedia);
+        const serverSttAvailable = isServerSttProvider(sttProvider) && supportsServerMic;
+        micBtn.disabled = !serverSttAvailable;
+        if (!serverSttAvailable) {
+          micDesired = false;
+          if (micActive) {
+            serverMic?.stop();
+            micActive = false;
+            micBtn.textContent = "Start Mic";
+          }
+        }
 
-	      setStatus(message.payload.demoMode ? "Ready (demo mode)" : sttProvider === "smallest-pulse" ? "Ready (smallest STT+TTS)" : "Ready");
+	      setStatus(
+          message.payload.demoMode
+            ? "Ready (demo mode)"
+            : serverSttAvailable
+              ? sttReadyStatus(sttProvider)
+              : "Ready (voice unavailable: server STT not configured)"
+        );
+        dlog("session.ready", {
+          demoMode: message.payload.demoMode,
+          sttProvider,
+          micMode,
+          ttsProvider: message.payload.voice?.ttsProvider
+        });
 		      setPhase(micDesired ? "listening" : "idle");
 		      procedureLabel.textContent = message.payload.procedureTitle;
 		      manualLabel.textContent = message.payload.manualTitle;
@@ -810,8 +1266,12 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
 	      }
 
 	      if (!micActive) {
-	        micStatus.textContent = micMode === "server-stt" ? "Mic idle (server STT)" : "Mic idle";
-	      }
+          micStatus.textContent = serverSttAvailable
+            ? micIdleText()
+            : supportsServerMic
+              ? "Server STT unavailable. Use typed input or command buttons."
+              : "Microphone unsupported in this browser";
+        }
 	      return;
 
 	    case "engine.state": {
@@ -876,6 +1336,7 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
       return;
 
     case "transcript.partial":
+      dlog("transcript.partial", { from: message.payload.from, text: message.payload.text });
       appendTranscript(message.payload.text, "partial");
       if (uiPhase !== "speaking") {
         setPhase("listening");
@@ -883,6 +1344,7 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
       return;
 
 	    case "transcript.final":
+        dlog("transcript.final", { from: message.payload.from, text: message.payload.text });
 	      if (message.payload.from === "user") {
 	        appendTranscript(message.payload.text, "user");
 	      }
@@ -893,6 +1355,7 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
 
     case "tts.start":
       streamSampleRates.set(message.payload.streamId, message.payload.sampleRate);
+      audioQueue.beginStream(message.payload.streamId);
       decodeFailureCount = 0;
       decodeFallbackAnnounced = false;
       setStatus("Speaking");
@@ -904,6 +1367,7 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
       return;
 
     case "tts.end":
+      audioQueue.endStream(message.payload.streamId);
       streamSampleRates.delete(message.payload.streamId);
       if (message.payload.reason === "stopped") {
         setStatus("Speech interrupted");
@@ -918,34 +1382,65 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
       return;
 
 	    case "metrics":
-	      metricsOutput.textContent = JSON.stringify(message.payload, null, 2);
+        setMetricsView(message.payload);
 	      return;
 
-	    case "stt.metrics":
-	      metricsOutput.textContent = JSON.stringify(message.payload, null, 2);
+		    case "stt.metrics":
+	        dlog("stt.metrics", message.payload as unknown as Record<string, unknown>);
+	        lastSttMetrics = message.payload as unknown as Record<string, unknown>;
+	        try {
+	          const payload = message.payload as any;
+	          const partialCount = Number(payload?.partialCount ?? 0);
+	          const audioBytes = Number(payload?.audioBytesReceived ?? 0);
+	          const maxRms = Number(payload?.maxAudioRms ?? payload?.firstAudioRms ?? 0);
+	          if (partialCount === 0 && audioBytes > 0 && maxRms >= 0.004) {
+	            recordSttFailure("STT_EMPTY_TRANSCRIPT");
+	          } else if (partialCount === 0 && audioBytes > 0) {
+	            dlog("stt.quiet_audio", { maxRms });
+	          }
+	        } catch {
+	          // ignore
+	        }
+	        setMetricsView(message.payload);
 	      return;
 
 	    case "rag.context":
-	      metricsOutput.textContent = JSON.stringify(
-	        {
-	          ragSource: message.payload.source,
+        setMetricsView({
+          ragSource: message.payload.source,
           query: message.payload.query,
           citations: message.payload.citations
-        },
-        null,
-        2
-      );
+        });
       return;
 
-    case "error":
+	    case "error":
+	      lastSttErrorCode = message.payload.code;
+	      dlog("server.error", { code: message.payload.code, retryable: message.payload.retryable, message: message.payload.message });
+	      if (message.payload.code.startsWith("STT_")) {
+	        if (message.payload.code === "STT_NO_AUDIO" && sttTransportMode !== "base64") {
+	          sttTransportMode = "base64";
+	          dlog("stt.transport_switch", {
+	            to: sttTransportMode,
+	            reason: message.payload.code,
+	            lastUtteranceClientStats: lastUtteranceClientStats ?? undefined
+	          });
+	        }
+	        const shouldRecordFailure =
+	          message.payload.code === "STT_NO_AUDIO" ||
+	          (message.payload.code === "STT_STREAM_FAILED" && Boolean(message.payload.retryable));
+	        if (shouldRecordFailure) {
+	          recordSttFailure(message.payload.code);
+	        }
+	      }
       // STT failures can be transient (no speech, upstream timeout). Keep the UI in listening mode
       // so it doesn't flap between "listening" and "error" while the mic stays active.
-      if (
-        message.payload.code === "STT_NO_SPEECH" ||
-        (message.payload.code === "STT_STREAM_FAILED" && Boolean(message.payload.retryable))
-      ) {
-        setStatus(message.payload.message);
-        setPhase(micDesired ? "listening" : "idle");
+	      if (
+	        message.payload.code === "STT_NO_SPEECH" ||
+	        message.payload.code === "STT_EMPTY_TRANSCRIPT" ||
+	        message.payload.code === "STT_NO_AUDIO" ||
+	        (message.payload.code === "STT_STREAM_FAILED" && Boolean(message.payload.retryable))
+	      ) {
+	        setStatus(message.payload.message);
+	        setPhase(micDesired ? "listening" : "idle");
         return;
       }
 
@@ -953,7 +1448,7 @@ async function playStreamChunk(streamId: string, chunkBase64: string): Promise<v
       setPhase("error");
       if (activeMode === "youtube" && !youtubeOverlay.classList.contains("hidden")) {
         showYoutubeOverlayMessage(
-          `${message.payload.message} Paste transcript text (.txt/.vtt/.srt) and start the session again.`,
+          `${message.payload.message} Paste guide steps/transcript text and start the session again.`,
           true
         );
       }
@@ -976,6 +1471,7 @@ function connectSocket(): Promise<void> {
       socket = ws;
       setStatus("Connected");
       setPhase(micDesired ? "listening" : "idle");
+      dlog("ws.open", { wsUrl });
       resolve();
     };
 
@@ -984,6 +1480,7 @@ function connectSocket(): Promise<void> {
         const message = JSON.parse(event.data) as ServerWsMessage;
         handleServerMessage(message);
       } catch {
+        derr("ws.invalid_payload", { data: String(event.data).slice(0, 200) });
         setStatus("Received invalid payload");
       }
     };
@@ -996,24 +1493,17 @@ function connectSocket(): Promise<void> {
         reason: event.reason,
         wasClean: event.wasClean
       });
+      dlog("ws.close", { code: event.code, reason: event.reason, wasClean: event.wasClean });
 
       setStatus(event.code ? `Disconnected (code ${event.code})` : "Disconnected");
       setPhase("idle");
       socket = null;
       micDesired = false;
       if (micActive) {
-        if (micMode === "server-stt") {
-          serverMic?.stop();
-          micActive = false;
-          micBtn.textContent = "Start Mic";
-          micStatus.textContent = "Mic idle";
-        } else {
-          try {
-            recognition?.stop();
-          } catch {
-            // ignore
-          }
-        }
+        serverMic?.stop();
+        micActive = false;
+        micBtn.textContent = "Start Mic";
+        micStatus.textContent = micIdleText();
       }
       awaitingYoutubeGreeting = false;
       lastYoutubeStage = null;
@@ -1022,6 +1512,7 @@ function connectSocket(): Promise<void> {
 
     ws.onerror = (event) => {
       console.error("WebSocket error", { wsUrl, event });
+      derr("ws.error", { wsUrl });
       setStatus("WebSocket error");
       setPhase("error");
       reject(new Error("WebSocket error"));
@@ -1029,109 +1520,31 @@ function connectSocket(): Promise<void> {
   });
 }
 
+function recordSttFailure(code: string): void {
+  const now = Date.now();
+  const windowMs = 30_000;
+  sttFailureWindow = sttFailureWindow.filter((ts) => now - ts <= windowMs);
+  sttFailureWindow.push(now);
+
+  if (sttFailureWindow.length < 3) {
+    return;
+  }
+
+  setStatus(`STT degraded (${code}). Keeping server STT only; use Hold-to-Talk + typed/buttons fallback.`);
+  dlog("stt_degraded_server_only", { code, failuresInWindow: sttFailureWindow.length });
+}
+
 function setupMic(): void {
-  const SpeechRecognitionCtor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
   const supportsServerMic = Boolean(navigator.mediaDevices?.getUserMedia);
-  if (!SpeechRecognitionCtor && !supportsServerMic) {
+  if (!supportsServerMic) {
     micStatus.textContent = "Microphone unsupported in this browser";
     micBtn.disabled = true;
     return;
   }
 
-  if (!SpeechRecognitionCtor) {
-    recognition = null;
-    micBtn.disabled = false;
-    micStatus.textContent = "Mic idle";
-    return;
-  }
-
-  recognition = new SpeechRecognitionCtor();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = "en-US";
-
-  recognition.onstart = () => {
-    micActive = true;
-    micBtn.textContent = "Stop Mic";
-    micStatus.textContent = "Listening";
-    setPhase("listening");
-  };
-
-  recognition.onend = () => {
-    micActive = false;
-    micBtn.textContent = "Start Mic";
-    micStatus.textContent = "Mic idle";
-    if (micDesired) {
-      micStatus.textContent = "Listening (restarting)";
-      setTimeout(() => {
-        if (!recognition || !micDesired) {
-          return;
-        }
-        try {
-          recognition.start();
-        } catch {
-          // Ignore invalid-state errors.
-        }
-      }, 250);
-    } else {
-      setPhase("idle");
-    }
-  };
-
-  recognition.onspeechstart = () => {
-    audioQueue.stopAll();
-    sendMessage({ type: "barge.in" });
-  };
-
-  recognition.onerror = (event: SpeechRecognitionErrorEventLike) => {
-    if (event.error === "no-speech") {
-      micStatus.textContent = "No speech detected. Try again.";
-      setStatus("Listening");
-      setPhase("listening");
-      return;
-    }
-
-    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-      micDesired = false;
-      micStatus.textContent = "Mic permission blocked. Enable microphone access and try again.";
-      setPhase("error");
-      return;
-    }
-
-    micStatus.textContent = `Mic error: ${event.error}`;
-    setPhase("error");
-  };
-
-  recognition.onresult = (event: SpeechRecognitionEventLike) => {
-    for (let i = event.resultIndex; i < event.results.length; i += 1) {
-      const result = event.results[i];
-      const text = result[0]?.transcript?.trim();
-      if (!text) {
-        continue;
-      }
-
-      if (result.isFinal) {
-        setThinking();
-        sendMessage({
-          type: "user.text",
-          payload: {
-            text,
-            source: "voice",
-            isFinal: true
-          }
-        });
-      } else {
-        sendMessage({
-          type: "user.text",
-          payload: {
-            text,
-            source: "voice",
-            isFinal: false
-          }
-        });
-      }
-    }
-  };
+  micMode = "server-stt";
+  micBtn.disabled = false;
+  micStatus.textContent = micIdleText();
 }
 
 resetManualUploadUi();
@@ -1168,7 +1581,8 @@ startSessionBtn.addEventListener("click", async () => {
 
 	  transcriptEl.innerHTML = "";
 	  partialMessageNode = null;
-	  metricsOutput.textContent = "No stream metrics yet.";
+	  metricsView = "No stream metrics yet.";
+    renderMetricsOutput();
 	  applianceLabel.textContent = "-";
 	  toolsLabel.textContent = "-";
 	  streamSampleRates.clear();
@@ -1240,10 +1654,7 @@ startSessionBtn.addEventListener("click", async () => {
       mode,
       manualScope: mode === "manual" && uploadedManualScope ? uploadedManualScope : undefined,
       youtubeUrl: youtubeUrlInput.value.trim() || undefined,
-      transcriptText: transcriptInput.value.trim() || undefined,
-      youtubeForceRefresh: mode === "youtube" ? youtubeForceRefreshInput.checked : undefined,
-      youtubePreferredLanguage:
-        mode === "youtube" ? youtubeLangInput.value.trim().toLowerCase() || undefined : undefined
+      transcriptText: transcriptInput.value.trim() || undefined
     }
   });
 
@@ -1255,21 +1666,12 @@ micBtn.addEventListener("click", async () => {
 
   if (micActive) {
     micDesired = false;
-
-    if (micMode === "server-stt") {
-      serverMic?.stop();
-      micActive = false;
-      micBtn.textContent = "Start Mic";
-      micStatus.textContent = micMode === "server-stt" ? "Mic idle (server STT)" : "Mic idle";
-      setPhase("idle");
-      return;
-    }
-
-    try {
-      recognition?.stop();
-    } catch {
-      // ignore
-    }
+    serverMic?.stop();
+    micActive = false;
+    micBtn.textContent = "Start Mic";
+    micStatus.textContent = micIdleText();
+    dlog("server_mic.stop");
+    setPhase("idle");
     return;
   }
 
@@ -1282,56 +1684,279 @@ micBtn.addEventListener("click", async () => {
   }
 
   micDesired = true;
-
-  if (micMode === "server-stt") {
-    const language = (navigator.language || "en").split(/[-_]/)[0] || "en";
-    if (!serverMic) {
-      serverMic = new ServerSttMic(
-        sendMessage,
-        (chunk) => {
-          if (!socket || socket.readyState !== WebSocket.OPEN) {
-            return;
-          }
-          socket.send(chunk);
-        },
-        () => {
-          audioQueue.stopAll();
-          sendMessage({ type: "barge.in" });
-          setStatus("Listening");
-          setPhase("listening");
-        },
-        () => {
-          setThinking("Processing speech...");
-        },
-        language
-      );
-    }
-
-    try {
-      await serverMic.start();
-    } catch (error) {
-      micDesired = false;
-      const detail = error instanceof Error ? error.message : String(error);
-      micStatus.textContent = `Mic error: ${detail}`;
-      setPhase("error");
-      return;
-    }
-
-    micActive = true;
-    micBtn.textContent = "Stop Mic";
-    micStatus.textContent = "Listening (server STT)";
-    setPhase("listening");
-    return;
-  }
-
-  if (!recognition) {
+  if (!isServerSttProvider(sttProvider)) {
     micDesired = false;
-    micStatus.textContent = "SpeechRecognition unsupported in this browser";
+    micStatus.textContent = "Server STT unavailable. Use typed input or command buttons.";
     setPhase("error");
     return;
   }
 
-  recognition.start();
+  const language = (navigator.language || "en").split(/[-_]/)[0] || "en";
+  const mic = getOrCreateServerMic(language);
+
+  try {
+    await mic.start();
+  } catch (error) {
+    micDesired = false;
+    const detail = error instanceof Error ? error.message : String(error);
+    micStatus.textContent = `Mic error: ${detail}`;
+    setPhase("error");
+    return;
+  }
+
+  const ready = await mic.awaitReady(750);
+  if (!ready) {
+    micDesired = false;
+    mic.stop();
+    micActive = false;
+    micBtn.textContent = "Start Mic";
+    micStatus.textContent = "Mic pipeline not producing audio frames (check mic permission/device).";
+    setPhase("error");
+    return;
+  }
+
+  micActive = true;
+  micBtn.textContent = "Stop Mic";
+  micStatus.textContent = "Listening (server STT)";
+  dlog("server_mic.start", { language });
+  setPhase("listening");
+});
+
+let pttHeld = false;
+let pttStartedMic = false;
+let pttToken = 0;
+let pttActivePointerId: number | null = null;
+
+function getOrCreateServerMic(language: string): ServerSttMic {
+  if (!serverMic) {
+    serverMic = new ServerSttMic(
+      sendMessage,
+      (chunk) => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        if (sttTransportMode === "base64") {
+          sendMessage({
+            type: "audio.chunk",
+            payload: {
+              chunkBase64: arrayBufferToBase64(chunk)
+            }
+          });
+          return;
+        }
+        socket.send(chunk);
+      },
+      () => {
+        audioQueue.stopAll();
+        sendMessage({ type: "barge.in" });
+        lastUtteranceClientStats = null;
+        const snapshot = serverMic ? serverMic.getDebugSnapshot() : undefined;
+        dlog("speech_start", {
+          ...(snapshot as unknown as Record<string, unknown> | undefined),
+          transport: sttTransportMode
+        });
+        setStatus(snapshot?.manualUtteranceActive ? "Listening (PTT)" : "Listening");
+        setPhase("listening");
+      },
+      () => {
+        lastUtteranceClientStats = serverMic?.getLastUtteranceStats() as unknown as Record<string, unknown> | null;
+        if (lastUtteranceClientStats) {
+          dlog("speech_end", { ...lastUtteranceClientStats, transport: sttTransportMode });
+        }
+        setThinking("Processing speech...");
+      },
+      language
+    );
+  }
+  return serverMic;
+}
+
+function releasePttPointerCapture(): void {
+  const pointerId = pttActivePointerId;
+  pttActivePointerId = null;
+  if (pointerId === null) {
+    return;
+  }
+  try {
+    pttBtn.releasePointerCapture(pointerId);
+  } catch {
+    // ignore
+  }
+}
+
+function pttIsCurrent(token: number): boolean {
+  return pttHeld && token === pttToken;
+}
+
+async function startPtt(token: number): Promise<void> {
+  if (pttHeld) {
+    return;
+  }
+  pttHeld = true;
+
+  dlog("ptt.start", { token, micMode, sttProvider, transport: sttTransportMode });
+
+  await audioQueue.resume();
+  if (!pttIsCurrent(token)) {
+    dlog("ptt.abort", { token, step: "after_resume" });
+    return;
+  }
+  try {
+    await connectSocket();
+  } catch {
+    setStatus("Could not connect to server");
+    setPhase("error");
+    pttHeld = false;
+    releasePttPointerCapture();
+    return;
+  }
+
+  if (!pttIsCurrent(token)) {
+    dlog("ptt.abort", { token, step: "after_connect" });
+    return;
+  }
+
+  const supportsServerMic = Boolean(navigator.mediaDevices?.getUserMedia);
+  if (!supportsServerMic || !isServerSttProvider(sttProvider)) {
+    setStatus("Hold-to-talk requires server STT. Use Start Mic or typed/buttons fallback.");
+    setPhase("error");
+    pttHeld = false;
+    releasePttPointerCapture();
+    return;
+  }
+
+  const language = (navigator.language || "en").split(/[-_]/)[0] || "en";
+  const mic = getOrCreateServerMic(language);
+
+  pttStartedMic = !mic.isActive;
+  if (!mic.isActive) {
+    try {
+      await mic.start();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setStatus(`Mic error: ${detail}`);
+      setPhase("error");
+      pttHeld = false;
+      pttStartedMic = false;
+      releasePttPointerCapture();
+      return;
+    }
+  }
+
+  if (!pttIsCurrent(token)) {
+    dlog("ptt.abort", { token, step: "after_mic_start" });
+    if (pttStartedMic && !micDesired && !pttHeld) {
+      mic.stop();
+      micActive = false;
+      micBtn.textContent = "Start Mic";
+      micStatus.textContent = micIdleText();
+      setPhase("idle");
+      pttStartedMic = false;
+    }
+    return;
+  }
+
+  const ready = await mic.awaitReady(750);
+  if (!pttIsCurrent(token)) {
+    dlog("ptt.abort", { token, step: "after_mic_ready" });
+    if (pttStartedMic && !micDesired && !pttHeld) {
+      mic.stop();
+      micActive = false;
+      micBtn.textContent = "Start Mic";
+      micStatus.textContent = micIdleText();
+      setPhase("idle");
+      pttStartedMic = false;
+    }
+    return;
+  }
+
+  if (!ready) {
+    setStatus("Mic pipeline not producing audio frames (check mic permission/device).");
+    setPhase("error");
+    pttHeld = false;
+    releasePttPointerCapture();
+    if (pttStartedMic && !micDesired) {
+      mic.stop();
+      micActive = false;
+      micBtn.textContent = "Start Mic";
+      micStatus.textContent = micIdleText();
+    }
+    pttStartedMic = false;
+    return;
+  }
+
+  micActive = true;
+  try {
+    mic.beginManualUtterance();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    setStatus(`PTT error: ${detail}`);
+    setPhase("error");
+    pttHeld = false;
+    releasePttPointerCapture();
+    return;
+  }
+}
+
+function stopPtt(reason: "ptt_release" | "ptt_cancel"): void {
+  if (!pttHeld) {
+    return;
+  }
+  pttHeld = false;
+  releasePttPointerCapture();
+
+  try {
+    serverMic?.endManualUtterance(reason);
+  } catch {
+    // ignore
+  }
+
+  if (pttStartedMic && !micDesired) {
+    const shouldStop = true;
+    if (shouldStop) {
+      setTimeout(() => {
+        if (micDesired) {
+          return;
+        }
+        serverMic?.stop();
+        micActive = false;
+        micBtn.textContent = "Start Mic";
+        micStatus.textContent = micIdleText();
+        setPhase("idle");
+      }, 350);
+    }
+  }
+
+  pttStartedMic = false;
+}
+
+pttBtn.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  if (pttHeld) {
+    return;
+  }
+  pttToken += 1;
+  pttActivePointerId = event.pointerId;
+  try {
+    pttBtn.setPointerCapture(event.pointerId);
+  } catch {
+    // ignore
+  }
+  dlog("ptt.pointerdown", { pointerId: event.pointerId, token: pttToken });
+  void startPtt(pttToken);
+});
+pttBtn.addEventListener("pointerup", (event) => {
+  event.preventDefault();
+  dlog("ptt.pointerup", { pointerId: event.pointerId, token: pttToken });
+  stopPtt("ptt_release");
+});
+pttBtn.addEventListener("pointercancel", (event) => {
+  event.preventDefault();
+  dlog("ptt.pointercancel", { pointerId: event.pointerId, token: pttToken });
+  stopPtt("ptt_cancel");
+});
+pttBtn.addEventListener("pointerleave", () => {
+  dlog("ptt.pointerleave", { token: pttToken });
 });
 
 typedForm.addEventListener("submit", async (event) => {

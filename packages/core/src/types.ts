@@ -136,6 +136,7 @@ export type TtsEndReason = "complete" | "stopped" | "error";
 
 export type YoutubeStatusStage = "extracting_transcript" | "compiling_guide" | "preparing_voice" | "ready";
 export type TtsStatusStage = "attempting" | "retrying" | "fallback";
+export type SttProvider = "smallest-pulse" | "openai-realtime" | "parallel" | "browser-speech";
 
 export interface RetrievalCitation {
   sourceRef: string | null;
@@ -161,7 +162,7 @@ export type ServerWsMessage =
 	        demoMode: boolean;
 	        voice: {
 	          ttsProvider: string;
-	          sttProvider: "smallest-pulse" | "browser-speech";
+	          sttProvider: SttProvider;
 	        };
 	        procedureTitle: string;
 	        manualTitle: string;
@@ -213,6 +214,8 @@ export type ServerWsMessage =
       payload: {
         text: string;
         from: "user" | "assistant";
+        utteranceId?: string;
+        provider?: string;
       };
     }
   | {
@@ -220,6 +223,8 @@ export type ServerWsMessage =
       payload: {
         text: string;
         from: "user" | "assistant";
+        utteranceId?: string;
+        provider?: string;
       };
     }
   | {
@@ -258,11 +263,24 @@ export type ServerWsMessage =
       type: "stt.metrics";
       payload: {
         streamId: string;
+        utteranceId?: string;
         provider: string;
+        winnerProvider?: string;
+        winnerTimeToFinalMs?: number | null;
+        loserReasons?: Array<{ provider: string; reason: string }>;
+        dualFailure?: boolean;
         timeToFirstTranscriptMs: number | null;
         partialCadenceMs: number | null;
         finalizationLatencyMs: number | null;
         partialCount: number;
+        pulseOpenedLatencyMs?: number | null;
+        pulseDebugSamples?: Array<{ kind: string; keys: string[]; sample: string }>;
+        audioBytesReceived?: number;
+        audioChunksReceived?: number;
+        firstAudioRms?: number | null;
+        maxAudioRms?: number | null;
+        avgAudioRms?: number | null;
+        vadFinalizedFallback?: boolean;
       };
     }
   | {

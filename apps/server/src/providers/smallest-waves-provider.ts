@@ -262,6 +262,11 @@ export class SmallestWavesProvider implements StreamingTtsProvider {
       const payload: Record<string, unknown> = {
         text: request.text,
         sample_rate: request.sampleRate,
+        language: request.language?.trim() || "en",
+        speed: request.speed ?? 1,
+        consistency: request.consistency ?? 0.5,
+        similarity: request.similarity ?? 0,
+        enhancement: request.enhancement ?? 1,
         add_wav_header: true,
         continue: false,
         flush: true
@@ -275,7 +280,7 @@ export class SmallestWavesProvider implements StreamingTtsProvider {
       ws.send(JSON.stringify(payload));
     });
 
-    ws.on("message", (rawData) => {
+    ws.on("message", (rawData, isBinary) => {
       if (hasEnded) {
         return;
       }
@@ -290,6 +295,29 @@ export class SmallestWavesProvider implements StreamingTtsProvider {
       try {
         parsed = JSON.parse(buffer.toString("utf8")) as WavesChunkMessage;
       } catch {
+        if (!isBinary) {
+          const candidate = buffer.toString("utf8").trim();
+          if (!candidate) {
+            return;
+          }
+
+          // Some implementations send occasional non-JSON text frames; ignore them rather than forwarding as audio.
+          if (!isLikelyBase64(candidate)) {
+            return;
+          }
+
+          sawAudio = true;
+          pushEvent({
+            type: "chunk",
+            streamId,
+            sequence,
+            audioBase64: normalizeBase64(candidate),
+            mimeType: "audio/wav"
+          });
+          sequence += 1;
+          return;
+        }
+
         sawAudio = true;
         pushEvent({
           type: "chunk",

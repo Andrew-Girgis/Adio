@@ -32,7 +32,7 @@
           </label>
           <label>
             Model (optional)
-            <input id="modelInput" placeholder="KDFE104HPS" />
+            <input id="modelInput" placeholder="Vitamix Nutrian Mix" />
           </label>
           <label>
             Manual PDF (optional)
@@ -50,15 +50,7 @@
             <input id="youtubeUrlInput" placeholder="https://www.youtube.com/watch?v=..." />
           </label>
           <label>
-            Caption Language Preference
-            <input id="youtubeLangInput" placeholder="en" value="en" />
-          </label>
-          <label class="checkbox-row">
-            <input id="youtubeForceRefreshInput" type="checkbox" />
-            Force refresh captions (bypass cache)
-          </label>
-          <label>
-            Transcript Paste (.txt/.vtt/.srt)
+            Guide steps/transcript paste
             <textarea id="transcriptInput" rows="5" placeholder="Paste transcript text here for YouTube Guide Mode"></textarea>
           </label>
           <label>
@@ -72,6 +64,7 @@
 
           <div class="mic-row">
             <button id="micBtn" class="secondary">Start Mic</button>
+            <button id="pttBtn" class="secondary" type="button" title="Hold to record one utterance">Hold to Talk</button>
             <span id="micStatus">Mic idle</span>
           </div>
 
@@ -98,6 +91,10 @@
 
           <div class="metrics">
             <h3>Debug Metrics</h3>
+            <label class="debug-toggle">
+              <input id="debugLogsToggle" type="checkbox" />
+              Debug logs
+            </label>
             <pre id="metricsOutput">No stream metrics yet.</pre>
             <a href="http://localhost:8787/debug" target="_blank" rel="noreferrer">Open /debug endpoint</a>
           </div>

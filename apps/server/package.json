@@ -8,6 +8,7 @@
     "start": "tsx src/index.ts",
     "ingest:manuals": "tsx src/rag/ingestManuals.ts",
     "backfill:manual-titles": "tsx src/rag/backfillManualTitles.ts",
+    "test": "node --test --import tsx src/youtube/transcriptCleaner.test.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

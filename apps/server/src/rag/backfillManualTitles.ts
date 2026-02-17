@@ -138,7 +138,7 @@ async function main(): Promise<void> {
 
   const { data, error } = await supabase
     .from("manual_documents")
-    .select("id,title,brand,model,source_filename,extraction_status,is_public,access_token_hash")
+    .select("id,title,brand,model,source_filename,extraction_status")
     .limit(limit);
 
   if (error) {
@@ -146,10 +146,7 @@ async function main(): Promise<void> {
   }
 
   const rows = ((data ?? []) as ManualDocumentRow[]).filter((row) => {
-    if (row.extraction_status !== "ready" && row.extraction_status !== "partial") {
-      return false;
-    }
-    return !row.brand || !row.model || isLowQualityTitle(row.title);
+    return row.extraction_status === "ready" || row.extraction_status === "partial";
   });
 
   log.info("backfill_candidates", {

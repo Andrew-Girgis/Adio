@@ -3,7 +3,7 @@
 Adio is a voice-first repair companion for home appliances and basic car fixes. It executes one procedural step at a time with confirmation-gated progression and interruption commands (`stop`, `resume`, `repeat`, `skip`, `explain`, `safety check`).
 
 Built for the AI Agents Waterloo Voice Hackathon with:
-- smallest.ai Pulse streaming STT (server-side)
+- parallel STT race (smallest.ai Pulse + OpenAI Realtime)
 - smallest.ai Waves streaming TTS (server-side)
 - Supabase Postgres + pgvector RAG
 - YouTube Guide Mode (transcript -> compiled procedure)
@@ -102,13 +102,16 @@ curl -s https://waves-api.smallest.ai/api/v1/lightning-v3.1/get_voices \\
 
 What this enables:
 - Browser mic audio is streamed to the backend (`audio.start` + binary PCM16 chunks + `audio.end`).
-- Backend runs smallest.ai Pulse streaming STT (WS) for partial + final transcripts.
+- Backend runs smallest.ai Pulse STT and can run OpenAI Realtime STT in parallel per utterance.
+- First non-empty final transcript wins; loser stream is cancelled.
 - Backend runs smallest.ai Waves streaming TTS (WS) for interruptible audio playback.
-- Barge-in aborts both STT + TTS sockets cleanly.
+- Barge-in aborts all active STT streams + TTS sockets cleanly.
 
 Fallback behavior:
-- If `DEMO_MODE=false` and `SMALLEST_API_KEY` is set, smallest.ai Pulse is primary STT and Waves is primary TTS.
-- If `DEMO_MODE=false` but `SMALLEST_API_KEY` is empty, the browser uses SpeechRecognition (STT) and the server uses demo TTS.
+- If `STT_PARALLEL_ENABLED=true` and both `SMALLEST_API_KEY` + `OPENAI_API_KEY` are set, STT runs in parallel (`STT_PROVIDER_ORDER` controls primary partials/provider order).
+- If one STT provider fails, Adio continues waiting on the other provider for that utterance.
+- If both STT providers fail/no-finalize, Adio emits a retryable STT error (`STT_NO_SPEECH`, `STT_EMPTY_TRANSCRIPT`, or `STT_STREAM_FAILED`).
+- If `DEMO_MODE=false` but neither STT provider key is present, the browser uses SpeechRecognition (STT) and the server uses demo TTS.
 - If smallest.ai fails during a session, server retries (`MAX_TTS_RETRIES`) and then falls back to demo TTS.
 - If Supabase retrieval fails, server retries once and then falls back to local keyword retrieval.
 
@@ -224,6 +227,12 @@ Expected response:
 | `SMALLEST_TTS_WS_URL` | No | Waves stream URL | smallest.ai streaming endpoint |
 | `SMALLEST_PULSE_WS_URL` | No | Pulse stream URL | smallest.ai streaming STT endpoint |
 | `SMALLEST_STT_LANGUAGE` | No | `en` | Pulse streaming language |
+| `OPENAI_API_KEY` | Optional | - | OpenAI auth for realtime STT (falls back to `EMBEDDINGS_API_KEY` if unset) |
+| `OPENAI_REALTIME_STT_WS_URL` | No | `wss://api.openai.com/v1/realtime` | OpenAI realtime STT websocket endpoint |
+| `OPENAI_REALTIME_STT_MODEL` | No | `gpt-4o-mini-transcribe` | OpenAI realtime transcription model |
+| `OPENAI_REALTIME_STT_LANGUAGE` | No | `en` | OpenAI realtime transcription language hint |
+| `STT_PARALLEL_ENABLED` | No | `false` | Enable dual-provider STT race per utterance |
+| `STT_PROVIDER_ORDER` | No | `smallest-pulse,openai-realtime` | STT provider priority/order |
 | `MAX_TTS_RETRIES` | No | `2` | reconnect retry count |
 | `TTS_STREAM_TIMEOUT_MS` | No | `12000` | timeout per smallest stream attempt |
 | `STT_STREAM_TIMEOUT_MS` | No | `20000` | timeout per smallest STT stream attempt |
@@ -247,7 +256,8 @@ Expected response:
 - Voice-first guided repair assistant with confirmation-gated, step-by-step execution.
 - Manual RAG mode with Supabase pgvector retrieval and local fallback.
 - YouTube Guide mode with URL-first caption extraction, deterministic transcript compiler, and citation grounding.
-- smallest.ai Pulse streaming STT + Waves streaming TTS (full end-to-end sponsor voice path).
+- parallel STT arbitration (smallest.ai Pulse + OpenAI Realtime) with exactly-once transcript finalization.
+- smallest.ai Waves streaming TTS (full end-to-end sponsor voice path).
 
 ### How to run
 ```bash

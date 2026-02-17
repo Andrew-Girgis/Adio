@@ -2,6 +2,11 @@ export interface TtsSynthesisRequest {
   text: string;
   voiceId: string;
   sampleRate: number;
+  language?: string;
+  speed?: number;
+  consistency?: number;
+  similarity?: number;
+  enhancement?: number;
   sessionId: string;
   signal: AbortSignal;
   timeoutMs: number;

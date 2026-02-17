@@ -35,6 +35,18 @@ interface SttStreamMetric {
   metrics: SttStreamMetrics;
 }
 
+interface SttRaceOutcomeMetric {
+  at: string;
+  sessionId: string;
+  utteranceId: string;
+  winnerProvider: string | null;
+  winnerTimeToFinalMs: number | null;
+  loserReasons: Array<{ provider: string; reason: string }>;
+  dualFailure: boolean;
+  shortUtterance: boolean;
+  success: boolean;
+}
+
 export class MetricsStore {
   private readonly launchedAt = new Date().toISOString();
   private activeSessions = 0;
@@ -47,12 +59,17 @@ export class MetricsStore {
   private ttsStreamTimeoutCount = 0;
   private ttsErrors = 0;
   private sttErrors = 0;
+  private sttDualFailureCount = 0;
+  private sttShortUtteranceTotal = 0;
+  private sttShortUtteranceSuccessCount = 0;
   private readonly ttfaSamples: number[] = [];
   private readonly ttftSamples: number[] = [];
   private readonly streamMetrics = new Map<string, StreamMetric>();
   private readonly sttStreamMetrics = new Map<string, SttStreamMetric>();
   private readonly lastTtsErrorBySession = new Map<string, TtsErrorMetric>();
   private readonly lastVoicePathBySession = new Map<string, string>();
+  private readonly sttRaceWinCountByProvider = new Map<string, number>();
+  private readonly recentSttRaceOutcomes: SttRaceOutcomeMetric[] = [];
 
   onSessionStart(): void {
     this.activeSessions += 1;
@@ -180,6 +197,34 @@ export class MetricsStore {
     this.lastVoicePathBySession.set(sessionId, path);
   }
 
+  onSttRaceOutcome(outcome: Omit<SttRaceOutcomeMetric, "at">): void {
+    const row: SttRaceOutcomeMetric = {
+      ...outcome,
+      at: new Date().toISOString()
+    };
+
+    this.recentSttRaceOutcomes.push(row);
+    if (this.recentSttRaceOutcomes.length > 80) {
+      this.recentSttRaceOutcomes.shift();
+    }
+
+    if (outcome.winnerProvider) {
+      const currentWins = this.sttRaceWinCountByProvider.get(outcome.winnerProvider) ?? 0;
+      this.sttRaceWinCountByProvider.set(outcome.winnerProvider, currentWins + 1);
+    }
+
+    if (outcome.dualFailure) {
+      this.sttDualFailureCount += 1;
+    }
+
+    if (outcome.shortUtterance) {
+      this.sttShortUtteranceTotal += 1;
+      if (outcome.success) {
+        this.sttShortUtteranceSuccessCount += 1;
+      }
+    }
+  }
+
   snapshot(debugSessions: Array<{ sessionId: string; stepIndex: number; status: string; phase: string }>) {
     const avgTtfaMs =
       this.ttfaSamples.length === 0
@@ -193,6 +238,14 @@ export class MetricsStore {
 
     const recentStreams = [...this.streamMetrics.values()].slice(-20);
     const recentSttStreams = [...this.sttStreamMetrics.values()].slice(-20);
+    const sttRaceWins = [...this.sttRaceWinCountByProvider.entries()].reduce<Record<string, number>>((acc, [provider, count]) => {
+      acc[provider] = count;
+      return acc;
+    }, {});
+    const sttShortUtteranceSuccessRate =
+      this.sttShortUtteranceTotal <= 0
+        ? null
+        : Math.round((this.sttShortUtteranceSuccessCount / this.sttShortUtteranceTotal) * 1000) / 1000;
     const sessions = debugSessions.map((session) => ({
       ...session,
       lastTtsError: this.lastTtsErrorBySession.get(session.sessionId) ?? null,
@@ -211,10 +264,16 @@ export class MetricsStore {
       ttsStreamTimeoutCount: this.ttsStreamTimeoutCount,
       ttsErrors: this.ttsErrors,
       sttErrors: this.sttErrors,
+      sttRaceWins,
+      sttDualFailureCount: this.sttDualFailureCount,
+      sttShortUtteranceTotal: this.sttShortUtteranceTotal,
+      sttShortUtteranceSuccessCount: this.sttShortUtteranceSuccessCount,
+      sttShortUtteranceSuccessRate,
       avgTtfaMs,
       avgTtftMs,
       recentStreams,
       recentSttStreams,
+      recentSttRaceOutcomes: this.recentSttRaceOutcomes.slice(-20),
       sessions
     };
   }

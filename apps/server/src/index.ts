@@ -15,6 +15,7 @@ import {
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import { loadConfig } from "./config";
 import { DemoTtsProvider } from "./providers/demo-tts-provider";
+import { isOpenAiRealtimeProviderError, OpenAiRealtimeSttProvider } from "./providers/openai-realtime-stt-provider";
 import { isPulseProviderError, SmallestPulseProvider } from "./providers/smallest-pulse-provider";
 import { SmallestWavesProvider } from "./providers/smallest-waves-provider";
 import { isTtsProviderError, type StreamingTtsProvider } from "./providers/types";
@@ -42,19 +43,60 @@ interface PushableAsyncIterable<T> extends AsyncIterable<T> {
   readonly closed: boolean;
 }
 
-interface ActiveSttStream {
-  abortController: AbortController;
+type SttProviderName = "smallest-pulse" | "openai-realtime";
+type SttProviderEndReason = "complete" | "stopped" | "error";
+
+interface SttProviderBranch {
+  provider: SttProviderName;
   streamId: string;
-  provider: string;
+  abortController: AbortController;
+  audioQueue: PushableAsyncIterable<Buffer>;
   startedAtMs: number;
-  audioEndedAtMs: number | null;
+  openedAtMs: number | null;
+  debugSamples: Array<{ kind: string; keys: string[]; sample: string }>;
   firstTranscriptAtMs: number | null;
   lastPartialAtMs: number | null;
   partialIntervalsMs: number[];
   partialCount: number;
   finalTranscriptAtMs: number | null;
+  finalizedViaFallback: boolean;
+  lastTranscriptText: string | null;
+  lastTranscriptAtMs: number | null;
+  finalizeFallbackTimer: NodeJS.Timeout | null;
+  endedReason: SttProviderEndReason | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  retryableError: boolean | null;
   metricsFinalized: boolean;
-  audioQueue: PushableAsyncIterable<Buffer>;
+}
+
+interface ActiveSttStream {
+  utteranceId: string;
+  streamId: string;
+  provider: string;
+  providerOrder: SttProviderName[];
+  primaryProvider: SttProviderName;
+  branches: SttProviderBranch[];
+  startedAtMs: number;
+  audioEndedAtMs: number | null;
+  audioBytesReceived: number;
+  audioChunksReceived: number;
+  firstAudioAtMs: number | null;
+  lastAudioAtMs: number | null;
+  firstAudioRms: number | null;
+  maxAudioRms: number | null;
+  audioRmsSum: number;
+  audioRmsCount: number;
+  firstTranscriptAtMs: number | null;
+  anyTranscriptSeen: boolean;
+  lastPartialAtMs: number | null;
+  partialIntervalsMs: number[];
+  partialCount: number;
+  finalTranscriptAtMs: number | null;
+  winnerProvider: SttProviderName | null;
+  winnerFinalText: string | null;
+  finalizedViaFallback: boolean;
+  metricsFinalized: boolean;
   noTranscriptTimer: NodeJS.Timeout | null;
   noSpeechSent: boolean;
 }
@@ -105,6 +147,10 @@ interface SessionContext {
   onboardingLastSource: AssistantMessageSource;
   onboardingLastRagContext: RagRetrievalResult | null;
   onboardingLastRagQuery: string | null;
+  lastPromptHash: string | null;
+  lastPromptAtMs: number | null;
+  lastAssistantTurnHash: string | null;
+  lastAssistantTurnAtMs: number | null;
   youtubeStepExplainMap: Record<number, string> | null;
   youtubeStepContextMap: Record<number, RagRetrievedChunk[]> | null;
   youtubeSourceRef: string | null;
@@ -141,13 +187,43 @@ const pulseProvider =
       })
     : null;
 
+const openAiRealtimeProvider =
+  !config.demoMode && config.openaiApiKey
+    ? new OpenAiRealtimeSttProvider({
+        apiKey: config.openaiApiKey,
+        wsUrl: config.openaiRealtimeWsUrl,
+        defaultModel: config.openaiRealtimeSttModel
+      })
+    : null;
+
 const primaryProvider: StreamingTtsProvider = config.demoMode || !wavesProvider ? demoProvider : wavesProvider;
 const fallbackProvider: StreamingTtsProvider | null = primaryProvider === demoProvider ? null : demoProvider;
 
+function configuredServerSttProvider(): "smallest-pulse" | "openai-realtime" | "parallel" | "browser-speech" {
+  const available: SttProviderName[] = [];
+  if (pulseProvider) {
+    available.push("smallest-pulse");
+  }
+  if (openAiRealtimeProvider) {
+    available.push("openai-realtime");
+  }
+  if (available.length === 0) {
+    return "browser-speech";
+  }
+
+  const ordered = resolveSttProviderOrder(available);
+  if (config.sttParallelEnabled && ordered.length >= 2) {
+    return "parallel";
+  }
+  return ordered[0] ?? "browser-speech";
+}
+
 const sessions = new Map<WebSocket, SessionContext>();
 const ONBOARDING_GREETING_PREFIX = "I'm Adio. I'll guide this repair step by step. You can ask questions anytime.";
-const ACTIVE_REPROMPT = "Say confirm when done, or ask explain/repeat.";
+const ACTIVE_REPROMPT = 'Say "confirm" (or just say "yes") when done, or ask explain/repeat.';
 const NO_SPEECH_REPROMPT_MS = 12_000;
+const ASSISTANT_TURN_DEDUP_MS = 1200;
+const DONE_PATTERN = /\b(done|finished|completed|all set|i'?m done|i did it|that'?s done)\b/i;
 const AMBIGUOUS_ADVANCE_UTTERANCES = new Set([
   "yes",
   "yeah",
@@ -223,12 +299,20 @@ function ragAssistantSource(session: SessionContext): AssistantMessageSource {
 
 const YES_WORDS = new Set(["yes", "yeah", "yep", "yup", "correct", "right", "sure", "ok", "okay", "confirm"]);
 const NO_WORDS = new Set(["no", "nope", "nah"]);
+const YES_PREFIX_PATTERN = /^(yes|yeah|yep|yup|ok|okay|correct|right|sure)\b/;
+const NO_PREFIX_PATTERN = /^(no|nope|nah)\b/;
 
 function parseYesNo(normalized: string): "yes" | "no" | null {
   if (YES_WORDS.has(normalized)) {
     return "yes";
   }
   if (NO_WORDS.has(normalized)) {
+    return "no";
+  }
+  if (YES_PREFIX_PATTERN.test(normalized)) {
+    return "yes";
+  }
+  if (NO_PREFIX_PATTERN.test(normalized)) {
     return "no";
   }
   return null;
@@ -277,6 +361,28 @@ function parseStepNumber(normalized: string): number | null {
   return STEP_NUMBER_WORDS[token] ?? null;
 }
 
+const DIRECT_HOW_QUESTION_PATTERN =
+  /\bhow\s+(?:to|do|can|should|would)\b|\bwhat(?:'s| is)\s+the\s+best\s+way\s+to\b/i;
+const EXPLAIN_COMMAND_ONLY_PATTERN = /^(?:please\s+)?(?:explain|why|details?|more detail|more details)(?:\s+please)?$/i;
+const EXPLAIN_STEP_REFERENCE_PATTERN =
+  /\b(?:explain|details?|clarify|elaborate|why|how)\b.*\b(?:this|that|current)\s+step\b|\b(?:this|that|current)\s+step\b.*\b(?:explain|details?|clarify|elaborate|why|how)\b|\b(?:explain|details?|clarify|elaborate)\b.*\bstep\s+\d{1,2}\b|\bstep\s+\d{1,2}\b.*\b(?:explain|details?|clarify|elaborate|why|how)\b/i;
+
+function isDirectHowQuestion(normalized: string): boolean {
+  return DIRECT_HOW_QUESTION_PATTERN.test(normalized);
+}
+
+function isExplainCurrentStepIntent(normalized: string): boolean {
+  return EXPLAIN_STEP_REFERENCE_PATTERN.test(normalized);
+}
+
+function shouldUseExplainCommand(normalized: string): boolean {
+  if (EXPLAIN_COMMAND_ONLY_PATTERN.test(normalized)) {
+    return true;
+  }
+
+  return isExplainCurrentStepIntent(normalized);
+}
+
 function parseStepIntent(
   normalized: string,
   currentStepNumber: number
@@ -314,7 +420,7 @@ function buildApplianceCandidates(ragResult: RagRetrievalResult | null | undefin
     return [];
   }
 
-  const byDoc = new Map<string, ApplianceCandidate>();
+  const byKey = new Map<string, ApplianceCandidate>();
 
   for (const chunk of ragResult.chunks) {
     const documentId = chunk.documentId;
@@ -323,31 +429,40 @@ function buildApplianceCandidates(ragResult: RagRetrievalResult | null | undefin
     }
 
     const title = chunk.documentTitle ?? chunk.section ?? "Manual";
-    const existing = byDoc.get(documentId);
+    const brand = chunk.brand;
+    const model = chunk.model;
+    const key = model ? `${(brand ?? "").toLowerCase()}:${normalizeModelForMatch(model)}` : normalizeModelForMatch(title);
+
+    const existing = byKey.get(key);
     if (!existing) {
-      byDoc.set(documentId, {
+      byKey.set(key, {
         documentId,
         title,
-        brand: chunk.brand,
-        model: chunk.model,
+        brand,
+        model,
         score: chunk.similarity
       });
       continue;
     }
 
-    existing.score = Math.max(existing.score, chunk.similarity);
+    if (chunk.similarity > existing.score) {
+      existing.documentId = documentId;
+      existing.score = chunk.similarity;
+    } else {
+      existing.score = Math.max(existing.score, chunk.similarity);
+    }
     if (!existing.title && title) {
       existing.title = title;
     }
-    if (!existing.brand && chunk.brand) {
-      existing.brand = chunk.brand;
+    if (!existing.brand && brand) {
+      existing.brand = brand;
     }
-    if (!existing.model && chunk.model) {
-      existing.model = chunk.model;
+    if (!existing.model && model) {
+      existing.model = model;
     }
   }
 
-  return [...byDoc.values()].sort((a, b) => b.score - a.score).slice(0, 3);
+  return [...byKey.values()].sort((a, b) => b.score - a.score).slice(0, 3);
 }
 
 function sendOnboardingPrompt(
@@ -357,6 +472,18 @@ function sendOnboardingPrompt(
   ragContext?: RagRetrievalResult,
   ragQuery?: string
 ): void {
+  const nowMs = performance.now();
+  const promptHash = createHash("sha256").update(prompt.text).digest("hex");
+  if (session.lastPromptHash === promptHash && session.lastPromptAtMs !== null && nowMs - session.lastPromptAtMs < 1500) {
+    log.debug("onboarding_prompt_deduped", {
+      sessionId: session.id,
+      source
+    });
+    return;
+  }
+
+  session.lastPromptHash = promptHash;
+  session.lastPromptAtMs = nowMs;
   session.onboardingLastPrompt = prompt;
   session.onboardingLastSource = source;
   session.onboardingLastRagContext = ragContext ?? null;
@@ -385,17 +512,29 @@ function buildApplianceSelectionPrompt(issue: string, candidates: ApplianceCandi
   }
 
   const lines = candidates.map((candidate, index) => `${index + 1}) ${describeAppliance(candidate)}`).join("\n");
+  const hint =
+    candidates.length === 2
+      ? 'Say "1" or "2", or say the model number.'
+      : candidates.length === 3
+        ? 'Say "1", "2", or "3", or say the model number.'
+        : 'Say the model number.';
+  const speechHint =
+    candidates.length === 2
+      ? "Say 1 or 2, or say the model number."
+      : candidates.length === 3
+        ? "Say 1, 2, or 3, or say the model number."
+        : "Say the model number.";
   return {
     text:
       `${ONBOARDING_GREETING_PREFIX} We'll work on: ${issue}. Which appliance is this?\n` +
       `${lines}\n` +
-      'Say "1", "2", or "3", or say the model number.',
-    speechText: `${ONBOARDING_GREETING_PREFIX} Which appliance is this? Say 1, 2, 3, or say the model number.`
+      hint,
+    speechText: `${ONBOARDING_GREETING_PREFIX} Which appliance is this? ${speechHint}`
   };
 }
 
 function buildToolsPrompt(tools: string[]): OnboardingPrompt {
-  const list = tools.length > 0 ? tools.join(", ") : "gloves and basic hand tools";
+  const list = tools.join(", ");
   return {
     text:
       `Before we start, tools you'll likely need: ${list}. ` +
@@ -407,6 +546,15 @@ function buildToolsPrompt(tools: string[]): OnboardingPrompt {
 const TOOL_LINE_PATTERN = /\b(tools?|you(?:'|\u2019)ll need|materials?|parts?)\b/i;
 const TOOL_STRIP_PATTERN = /[^a-z0-9\s-]/g;
 const TOOL_SKIP_PATTERN = /\b(tool|tools|material|materials|need|you|will|this|that|then|step|parts?)\b/;
+const TOOLISH_KEYWORD_PATTERN =
+  /\b(screwdriver|driver|pliers|wrench|socket|hammer|knife|putty|brush|vac|vacuum|flashlight|multimeter|gloves|goggles|glasses|towels|bucket|clamp|lubricant|soap|oil|torx|allen|hex)\b/i;
+const TOOL_REF_PATTERN = /\b(transcript|timestamp|chapter)\b/i;
+const TOOL_PAGE_REF_PATTERN = /\bp\d{1,4}\b/i;
+const TOOL_CHUNK_REF_PATTERN = /\bc\d{1,6}\b/i;
+const TOOL_TIME_REF_PATTERN = /\b\d{1,2}:\d{2}\b/;
+const TOOL_NUMBERISH_PATTERN = /^[0-9][0-9\s-]*$/;
+const TOOL_INTRO_MARKER_PATTERN =
+  /\b(?:tools?|materials?|parts?|you(?:'|\u2019)ll need)\b\s*[:\-]\s*/i;
 
 const TOOL_MATCHERS: Array<{ name: string; pattern: RegExp }> = [
   { name: "phillips screwdriver", pattern: /\bphillips\s+screwdriver\b/i },
@@ -443,23 +591,71 @@ function extractToolsFromText(text: string, tools: Set<string>): void {
     return;
   }
 
-  const candidates = cleaned
-    .split(/[:,.;]|\band\b/gi)
+  const introMatch = cleaned.match(TOOL_INTRO_MARKER_PATTERN);
+  if (!introMatch || introMatch.index === undefined) {
+    return;
+  }
+
+  const listText = cleaned.slice(introMatch.index + introMatch[0].length);
+  if (!listText) {
+    return;
+  }
+
+  const candidates = listText
+    .split(/[;,]|\band\b/gi)
     .map((entry) => entry.trim().toLowerCase())
     .filter((entry) => entry.length >= 3);
 
   for (const candidate of candidates) {
-    if (TOOL_SKIP_PATTERN.test(candidate) && candidate.split(" ").length <= 2) {
-      continue;
-    }
-    if (candidate.length > 36) {
-      continue;
-    }
-    const normalized = candidate.replace(TOOL_STRIP_PATTERN, "").trim();
+    const normalized = sanitizeToolCandidate(candidate);
     if (normalized) {
       tools.add(normalized);
     }
   }
+}
+
+function toolLooksLikeRef(text: string): boolean {
+  return (
+    TOOL_REF_PATTERN.test(text) ||
+    TOOL_TIME_REF_PATTERN.test(text) ||
+    TOOL_PAGE_REF_PATTERN.test(text) ||
+    TOOL_CHUNK_REF_PATTERN.test(text) ||
+    TOOL_NUMBERISH_PATTERN.test(text)
+  );
+}
+
+function isToolish(text: string): boolean {
+  return TOOLISH_KEYWORD_PATTERN.test(text);
+}
+
+function sanitizeToolCandidate(raw: string): string | null {
+  const normalized = raw.replace(TOOL_STRIP_PATTERN, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (toolLooksLikeRef(normalized)) {
+    return null;
+  }
+
+  const wordCount = normalized.split(" ").filter(Boolean).length;
+  if (wordCount > 4) {
+    return null;
+  }
+
+  if (!isToolish(normalized)) {
+    return null;
+  }
+
+  if (TOOL_SKIP_PATTERN.test(normalized) && wordCount <= 2) {
+    return null;
+  }
+
+  if (normalized.length > 36) {
+    return null;
+  }
+
+  return normalized;
 }
 
 function extractToolsFromProcedure(procedure: ProcedureDefinition, tools: Set<string>): void {
@@ -485,9 +681,19 @@ async function computeToolsForSession(session: SessionContext): Promise<{
   // Prefer explicitly extracted tools (YouTube), then fall back to heuristics.
   if (session.mode === "youtube" && session.toolsRequired) {
     session.toolsRequired.forEach((tool) => {
-      const normalized = tool.trim().replace(TOOL_STRIP_PATTERN, "").toLowerCase();
+      const normalized = sanitizeToolCandidate(tool);
       if (normalized) {
         tools.add(normalized);
+        return;
+      }
+
+      // Keep curated tools even if the free-form filter rejects them.
+      const cleaned = tool.replace(/\s+/g, " ").trim();
+      for (const matcher of TOOL_MATCHERS) {
+        if (matcher.pattern.test(cleaned)) {
+          tools.add(matcher.name);
+          break;
+        }
       }
     });
   }
@@ -523,7 +729,6 @@ function startProcedure(session: SessionContext): void {
 }
 
 async function beginToolsGate(session: SessionContext): Promise<void> {
-  session.onboardingStage = "confirm_tools";
   const computed = await computeToolsForSession(session);
   session.toolsRequired = computed.tools;
 
@@ -531,6 +736,21 @@ async function beginToolsGate(session: SessionContext): Promise<void> {
     tools: computed.tools
   });
 
+  if (computed.tools.length === 0) {
+    sendAssistantTurn(
+      session,
+      "No tools are required for this task.",
+      undefined,
+      undefined,
+      true,
+      "No tools are required for this task.",
+      "general"
+    );
+    startProcedure(session);
+    return;
+  }
+
+  session.onboardingStage = "confirm_tools";
   sendOnboardingPrompt(session, buildToolsPrompt(computed.tools), computed.source, computed.ragContext, computed.ragQuery);
 }
 
@@ -588,7 +808,8 @@ function repeatOnboardingPrompt(session: SessionContext): void {
     session.onboardingLastRagQuery ?? undefined,
     true,
     prompt.speechText,
-    session.onboardingLastSource
+    session.onboardingLastSource,
+    { force: true }
   );
 }
 
@@ -660,9 +881,22 @@ async function handleOnboardingUserText(session: SessionContext, text: string): 
     }
 
     if (affirmative === "no") {
+      const count = session.applianceCandidates.length;
+      const hint =
+        count === 2
+          ? 'Ok. Say "1" or "2", or say the model number. You can also say "skip".'
+          : count >= 3
+            ? 'Ok. Say "1", "2", or "3", or say the model number. You can also say "skip".'
+            : 'Ok. Say the model number. You can also say "skip".';
+      const speechHint =
+        count === 2
+          ? "Ok. Say 1 or 2, or say the model number. You can also say skip."
+          : count >= 3
+            ? "Ok. Say 1, 2, or 3, or say the model number. You can also say skip."
+            : "Ok. Say the model number. You can also say skip.";
       sendOnboardingPrompt(session, {
-        text: 'Ok. Say "1", "2", or "3", or say the model number. You can also say "skip".',
-        speechText: "Ok. Say 1, 2, or 3, or say the model number."
+        text: hint,
+        speechText: speechHint
       });
       return;
     }
@@ -777,10 +1011,38 @@ function noSpeechRepromptCopy(session: SessionContext): { text: string; speechTe
     return null;
   }
 
-  if (session.phase === "onboarding" && session.onboardingLastPrompt) {
+  if (session.phase === "onboarding") {
+    if (session.onboardingStage === "confirm_tools") {
+      return {
+        text: `I'm listening. Do you have the tools? Say "yes" or "no". You can also say repeat.`,
+        speechText: "I'm listening. Do you have the tools? Say yes or no. You can also say repeat."
+      };
+    }
+
+    if (session.onboardingStage === "select_appliance") {
+      const count = session.applianceCandidates.length;
+      const hintText =
+        count === 2
+          ? 'Say "1" or "2"'
+          : count >= 3
+            ? 'Say "1", "2", or "3"'
+            : null;
+      const hintSpeech = count === 2 ? "Say 1 or 2" : count >= 3 ? "Say 1, 2, or 3" : null;
+      if (hintText && hintSpeech) {
+        return {
+          text: `I'm listening. Say "yes" or "no". ${hintText}, or say the model number. You can also say "skip".`,
+          speechText: `I'm listening. Say yes or no. ${hintSpeech}, or say the model number. You can also say skip.`
+        };
+      }
+      return {
+        text: `I'm listening. Say "yes" or "no", or say the model number. You can also say "skip".`,
+        speechText: "I'm listening. Say yes or no, or say the model number. You can also say skip."
+      };
+    }
+
     return {
-      text: session.onboardingLastPrompt.text,
-      speechText: session.onboardingLastPrompt.speechText ?? session.onboardingLastPrompt.text
+      text: `I'm listening. Say "yes" or "no". You can also say repeat.`,
+      speechText: "I'm listening. Say yes or no. You can also say repeat."
     };
   }
 
@@ -792,7 +1054,7 @@ function noSpeechRepromptCopy(session: SessionContext): { text: string; speechTe
   if (session.mode === "youtube") {
     return {
       text: ACTIVE_REPROMPT,
-      speechText: "I'm listening. Say confirm when you're done, or say repeat."
+      speechText: "I'm listening. Say confirm, or just say yes, when you're done. You can also say repeat."
     };
   }
 
@@ -828,28 +1090,15 @@ function scheduleNoSpeechReprompt(session: SessionContext): void {
       return;
     }
 
-    const reprompt = noSpeechRepromptCopy(session);
-    if (!reprompt) {
-      return;
-	    }
-	
-	    session.lastNoSpeechRepromptKey = key;
-	    if (session.phase === "onboarding" && session.onboardingLastPrompt) {
-	      sendAssistantTurn(
-	        session,
-	        session.onboardingLastPrompt.text,
-	        session.onboardingLastRagContext ?? undefined,
-	        session.onboardingLastRagQuery ?? undefined,
-	        true,
-	        session.onboardingLastPrompt.speechText,
-	        session.onboardingLastSource
-	      );
+	    const reprompt = noSpeechRepromptCopy(session);
+	    if (!reprompt) {
 	      return;
-	    }
-
-	    sendAssistantTurn(session, reprompt.text, undefined, undefined, true, reprompt.speechText);
-	  }, NO_SPEECH_REPROMPT_MS);
-	}
+		    }
+		
+		    session.lastNoSpeechRepromptKey = key;
+		    sendAssistantTurn(session, reprompt.text, undefined, undefined, true, reprompt.speechText, "general");
+		  }, NO_SPEECH_REPROMPT_MS);
+		}
 
 function send(ws: WebSocket, message: ServerWsMessage): void {
   if (ws.readyState !== ws.OPEN) {
@@ -1136,14 +1385,35 @@ function sendAssistantTurn(
   ragQuery?: string,
   shouldSpeak = true,
   speechText?: string,
-  source: AssistantMessageSource = "general"
+  source: AssistantMessageSource = "general",
+  opts?: { force?: boolean }
 ): void {
+  const nowMs = performance.now();
+  const normalizedText = normalizeAllCapsPhrases(text);
+  const normalizedSpeechText = speechText ? normalizeAllCapsPhrases(speechText) : undefined;
+  const dedupeHash = createHash("sha256").update(`${source}\n${normalizedText}`).digest("hex");
+  if (
+    !opts?.force &&
+    session.lastAssistantTurnHash === dedupeHash &&
+    session.lastAssistantTurnAtMs !== null &&
+    nowMs - session.lastAssistantTurnAtMs < ASSISTANT_TURN_DEDUP_MS
+  ) {
+    log.debug("assistant_turn_deduped", {
+      sessionId: session.id,
+      source
+    });
+    return;
+  }
+
+  session.lastAssistantTurnHash = dedupeHash;
+  session.lastAssistantTurnAtMs = nowMs;
+
   touchAssistantActivity(session);
   const citations = ragContext ? manualService.toCitations(ragContext.chunks).slice(0, 3) : [];
   send(session.ws, {
     type: "assistant.message",
     payload: {
-      text,
+      text: normalizedText,
       source,
       citations: citations.length > 0 ? citations : undefined
     }
@@ -1163,14 +1433,14 @@ function sendAssistantTurn(
   send(session.ws, {
     type: "transcript.final",
     payload: {
-      text,
+      text: normalizedText,
       from: "assistant"
     }
   });
 
   if (shouldSpeak) {
     clearNoSpeechReprompt(session);
-    const spoken = (speechText ?? text).trim();
+    const spoken = (normalizedSpeechText ?? normalizedText).trim();
     if (spoken) {
       enqueueSpeech(session, spoken);
     }
@@ -1193,6 +1463,10 @@ function interruptActiveStream(session: SessionContext): void {
   }
 
   session.activeStream.abortController.abort();
+}
+
+function getSttBranch(active: ActiveSttStream, provider: SttProviderName): SttProviderBranch | null {
+  return active.branches.find((branch) => branch.provider === provider) ?? null;
 }
 
 function computeSttMetrics(active: ActiveSttStream): {
@@ -1225,13 +1499,107 @@ function computeSttMetrics(active: ActiveSttStream): {
   };
 }
 
+function computeSttBranchMetrics(active: ActiveSttStream, branch: SttProviderBranch): {
+  timeToFirstTranscriptMs: number | null;
+  partialCadenceMs: number | null;
+  finalizationLatencyMs: number | null;
+  partialCount: number;
+} {
+  const timeToFirstTranscriptMs =
+    branch.firstTranscriptAtMs === null ? null : Math.max(0, Math.round(branch.firstTranscriptAtMs - active.startedAtMs));
+  const partialCadenceMs =
+    branch.partialIntervalsMs.length === 0
+      ? null
+      : Math.max(
+          0,
+          Math.round(branch.partialIntervalsMs.reduce((sum, value) => sum + value, 0) / branch.partialIntervalsMs.length)
+        );
+  const finalizationLatencyMs =
+    active.audioEndedAtMs === null || branch.finalTranscriptAtMs === null
+      ? null
+      : Math.max(0, Math.round(branch.finalTranscriptAtMs - active.audioEndedAtMs));
+
+  return {
+    timeToFirstTranscriptMs,
+    partialCadenceMs,
+    finalizationLatencyMs,
+    partialCount: branch.partialCount
+  };
+}
+
 function clearSttNoTranscriptTimer(active: ActiveSttStream): void {
+  for (const branch of active.branches) {
+    clearSttFinalizeFallbackTimer(branch);
+  }
+
   if (!active.noTranscriptTimer) {
     return;
   }
 
   clearTimeout(active.noTranscriptTimer);
   active.noTranscriptTimer = null;
+}
+
+function clearSttFinalizeFallbackTimer(branch: SttProviderBranch): void {
+  if (!branch.finalizeFallbackTimer) {
+    return;
+  }
+
+  clearTimeout(branch.finalizeFallbackTimer);
+  branch.finalizeFallbackTimer = null;
+}
+
+function armSttFinalizeFallbackTimer(
+  session: SessionContext,
+  active: ActiveSttStream,
+  branch: SttProviderBranch,
+  commitFinalTranscript: (provider: SttProviderName, text: string, viaFallback: boolean) => Promise<void>
+): void {
+  clearSttFinalizeFallbackTimer(branch);
+
+  if (active.audioEndedAtMs === null || active.finalTranscriptAtMs !== null) {
+    return;
+  }
+
+  const candidate = (branch.lastTranscriptText ?? "").trim();
+  if (!candidate) {
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    branch.finalizeFallbackTimer = null;
+
+    if (!sessions.has(session.ws)) {
+      return;
+    }
+
+    const current = session.activeStt;
+    if (!current || current.streamId !== active.streamId) {
+      return;
+    }
+
+    if (active.audioEndedAtMs === null || active.finalTranscriptAtMs !== null) {
+      return;
+    }
+
+    const text = (branch.lastTranscriptText ?? "").trim();
+    if (!text) {
+      return;
+    }
+
+    branch.finalizedViaFallback = true;
+    void commitFinalTranscript(branch.provider, text, true).catch((error) => {
+      log.error("stt_finalize_fallback_failed", {
+        sessionId: session.id,
+        streamId: active.streamId,
+        provider: branch.provider,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }, STT_FINALIZE_FALLBACK_MS);
+
+  timer.unref?.();
+  branch.finalizeFallbackTimer = timer;
 }
 
 function finalizeActiveSttStream(
@@ -1249,12 +1617,80 @@ function finalizeActiveSttStream(
 
   metrics.onSttStreamEnd(active.streamId, status, computed);
 
+  for (const branch of active.branches) {
+    if (branch.metricsFinalized) {
+      continue;
+    }
+    branch.metricsFinalized = true;
+
+    const branchStatus: "completed" | "stopped" | "error" =
+      branch.endedReason === "error"
+        ? "error"
+        : branch.provider === active.winnerProvider
+          ? status === "error"
+            ? "completed"
+            : status
+          : "stopped";
+
+    metrics.onSttStreamEnd(branch.streamId, branchStatus, computeSttBranchMetrics(active, branch));
+  }
+
+  const pulseBranch = getSttBranch(active, "smallest-pulse");
+  const pulseOpenedLatencyMs =
+    pulseBranch?.openedAtMs === null || pulseBranch?.openedAtMs === undefined
+      ? null
+      : Math.max(0, Math.round(pulseBranch.openedAtMs - active.startedAtMs));
+  const avgAudioRms = active.audioRmsCount > 0 ? active.audioRmsSum / active.audioRmsCount : null;
+
+  const loserReasons = active.branches
+    .filter((branch) => branch.provider !== active.winnerProvider)
+    .map((branch) => ({
+      provider: branch.provider,
+      reason: branch.errorCode ?? branch.endedReason ?? "pending"
+    }));
+
+  const winnerTimeToFinalMs =
+    active.finalTranscriptAtMs === null ? null : Math.max(0, Math.round(active.finalTranscriptAtMs - active.startedAtMs));
+  const success = active.winnerProvider !== null;
+  const dualFailure = status === "error" && !success;
+  const winnerWords = (active.winnerFinalText ?? "").split(/\s+/).filter(Boolean).length;
+  const shortByWords = winnerWords > 0 && winnerWords <= STT_SHORT_UTTERANCE_MAX_WORDS;
+  const shortByDuration =
+    active.firstAudioAtMs !== null &&
+    active.audioEndedAtMs !== null &&
+    Math.max(0, active.audioEndedAtMs - active.firstAudioAtMs) <= STT_SHORT_UTTERANCE_MS;
+  const shortUtterance = status === "stopped" ? false : shortByWords || shortByDuration;
+
+  metrics.onSttRaceOutcome({
+    sessionId: session.id,
+    utteranceId: active.utteranceId,
+    winnerProvider: active.winnerProvider,
+    winnerTimeToFinalMs,
+    loserReasons,
+    dualFailure,
+    shortUtterance,
+    success
+  });
+
   send(session.ws, {
     type: "stt.metrics",
     payload: {
       streamId: active.streamId,
+      utteranceId: active.utteranceId,
       provider: active.provider,
-      ...computed
+      winnerProvider: active.winnerProvider ?? undefined,
+      winnerTimeToFinalMs,
+      loserReasons,
+      dualFailure,
+      ...computed,
+      pulseOpenedLatencyMs,
+      pulseDebugSamples: pulseBranch && pulseBranch.debugSamples.length > 0 ? pulseBranch.debugSamples : undefined,
+      audioBytesReceived: active.audioBytesReceived,
+      audioChunksReceived: active.audioChunksReceived,
+      firstAudioRms: active.firstAudioRms,
+      maxAudioRms: active.maxAudioRms,
+      avgAudioRms,
+      vadFinalizedFallback: active.finalizedViaFallback
     }
   });
 }
@@ -1266,8 +1702,11 @@ function interruptActiveSttStream(session: SessionContext, status: "stopped" | "
   }
 
   clearSttNoTranscriptTimer(active);
-  active.audioQueue.close();
-  active.abortController.abort();
+  for (const branch of active.branches) {
+    branch.audioQueue.close();
+    branch.abortController.abort();
+    branch.endedReason = branch.endedReason ?? "stopped";
+  }
   finalizeActiveSttStream(session, active, status);
   session.activeStt = undefined;
 }
@@ -1295,7 +1734,8 @@ function applyEngineResult(
   result: EngineResult,
   ragContext?: RagRetrievalResult,
   ragQuery?: string,
-  source?: AssistantMessageSource
+  source?: AssistantMessageSource,
+  assistantOpts?: { force?: boolean }
 ): void {
   send(session.ws, {
     type: "engine.state",
@@ -1314,7 +1754,8 @@ function applyEngineResult(
     shouldCite ? ragQuery : undefined,
     result.shouldSpeak,
     result.speechText,
-    resolvedSource
+    resolvedSource,
+    assistantOpts
   );
 }
 
@@ -1328,6 +1769,11 @@ async function streamWithProvider(
   for await (const event of provider.synthesize({
     text,
     sampleRate: config.sampleRate,
+    language: config.smallestTtsLanguage,
+    speed: config.smallestTtsSpeed,
+    consistency: config.smallestTtsConsistency,
+    similarity: config.smallestTtsSimilarity,
+    enhancement: config.smallestTtsEnhancement,
     sessionId: session.id,
     signal: abortController.signal,
     voiceId,
@@ -1595,9 +2041,32 @@ async function streamAssistantText(session: SessionContext, text: string): Promi
 
 const STT_ENCODING = "linear16" as const;
 const STT_SAMPLE_RATE = 16000;
-const STT_NO_TRANSCRIPT_GRACE_MS = 5000;
+const STT_QUIET_RMS_THRESHOLD = 0.004;
+const STT_NO_TRANSCRIPT_GRACE_MS_QUIET = 5000;
+const STT_NO_TRANSCRIPT_GRACE_MS_SPEECH = 9000;
+const STT_FINALIZE_FALLBACK_MS = 1200;
+const STT_SHORT_UTTERANCE_MS = 1500;
+const STT_SHORT_UTTERANCE_MAX_WORDS = 2;
 
-function normalizeSttLanguage(requested: string | undefined): string {
+function rmsPcm16(buffer: Buffer, maxSamples = 4096): number | null {
+  if (buffer.length < 2) {
+    return null;
+  }
+
+  const sampleCount = Math.min(Math.floor(buffer.length / 2), maxSamples);
+  if (sampleCount <= 0) {
+    return null;
+  }
+
+  let sum = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const value = buffer.readInt16LE(i * 2) / 32768;
+    sum += value * value;
+  }
+  return Math.sqrt(sum / sampleCount);
+}
+
+function normalizePulseSttLanguage(requested: string | undefined): string {
   const candidate = (requested ?? config.smallestSttLanguage).trim();
   if (!candidate) {
     return config.smallestSttLanguage;
@@ -1607,16 +2076,373 @@ function normalizeSttLanguage(requested: string | undefined): string {
   return candidate.split(/[-_]/)[0] || candidate;
 }
 
+function normalizeOpenAiSttLanguage(requested: string | undefined): string {
+  const candidate = (requested ?? config.openaiRealtimeSttLanguage).trim();
+  if (!candidate) {
+    return config.openaiRealtimeSttLanguage;
+  }
+  return candidate.split(/[-_]/)[0] || candidate;
+}
+
+function supportedSttProviderName(value: string): SttProviderName | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "smallest-pulse" || normalized === "openai-realtime") {
+    return normalized;
+  }
+  return null;
+}
+
+function resolveSttProviderOrder(available: SttProviderName[]): SttProviderName[] {
+  const ordered: SttProviderName[] = [];
+  const candidate = [...config.sttProviderOrder, "smallest-pulse", "openai-realtime"];
+  for (const value of candidate) {
+    const normalized = supportedSttProviderName(value);
+    if (!normalized) {
+      continue;
+    }
+    if (!available.includes(normalized)) {
+      continue;
+    }
+    if (!ordered.includes(normalized)) {
+      ordered.push(normalized);
+    }
+  }
+  return ordered;
+}
+
+function hasSttFinal(active: ActiveSttStream): boolean {
+  return active.finalTranscriptAtMs !== null && Boolean(active.winnerProvider) && Boolean(active.winnerFinalText);
+}
+
+function sttQuietAudio(active: ActiveSttStream): { quiet: boolean; rms: number | null } {
+  const rms = active.maxAudioRms ?? active.firstAudioRms;
+  return {
+    rms,
+    quiet: rms !== null && rms < STT_QUIET_RMS_THRESHOLD
+  };
+}
+
+function sttFailurePayload(active: ActiveSttStream): { code: string; message: string; retryable: boolean } {
+  const { quiet, rms } = sttQuietAudio(active);
+  const timeoutOnly = active.branches.every((branch) => branch.errorCode === null || branch.errorCode === "stream_timeout");
+  const retryable = timeoutOnly || active.branches.some((branch) => branch.retryableError === true);
+
+  if (quiet && timeoutOnly) {
+    const quietHint = rms !== null ? ` (max RMS ${rms.toFixed(4)})` : "";
+    return {
+      code: "STT_NO_SPEECH",
+      message: `No speech detected. Try again${quietHint}. Check the selected mic device and OS input level.`,
+      retryable: true
+    };
+  }
+
+  if (timeoutOnly) {
+    return {
+      code: "STT_EMPTY_TRANSCRIPT",
+      message: "Speech audio was received, but the STT providers returned no transcript. Try again (or speak a little longer).",
+      retryable: true
+    };
+  }
+
+  return {
+    code: "STT_STREAM_FAILED",
+    message: "Speech recognition failed. Try again.",
+    retryable
+  };
+}
+
+function emitSttFailure(session: SessionContext, active: ActiveSttStream): void {
+  if (active.noSpeechSent || hasSttFinal(active)) {
+    return;
+  }
+  active.noSpeechSent = true;
+  const failure = sttFailurePayload(active);
+  send(session.ws, {
+    type: "error",
+    payload: failure
+  });
+}
+
+function allSttBranchesSettled(active: ActiveSttStream): boolean {
+  return active.branches.every((branch) => branch.endedReason !== null || branch.abortController.signal.aborted);
+}
+
+function finalizeSttBranchMetrics(active: ActiveSttStream, branch: SttProviderBranch, overallStatus: "completed" | "stopped" | "error"): void {
+  if (branch.metricsFinalized) {
+    return;
+  }
+  branch.metricsFinalized = true;
+
+  const status: "completed" | "stopped" | "error" =
+    branch.provider === active.winnerProvider
+      ? overallStatus === "error"
+        ? "completed"
+        : overallStatus
+      : branch.endedReason === "error"
+        ? "error"
+        : "stopped";
+
+  metrics.onSttStreamEnd(branch.streamId, status, computeSttBranchMetrics(active, branch));
+}
+
+function maybeFinalizeSttUtterance(
+  session: SessionContext,
+  active: ActiveSttStream,
+  status: "completed" | "stopped" | "error"
+): void {
+  if (active.metricsFinalized) {
+    return;
+  }
+
+  finalizeActiveSttStream(session, active, status);
+  if (session.activeStt?.streamId === active.streamId) {
+    session.activeStt = undefined;
+  }
+}
+
+function runSttBranch(
+  session: SessionContext,
+  active: ActiveSttStream,
+  branch: SttProviderBranch,
+  payload: { language?: string },
+  commitFinalTranscript: (provider: SttProviderName, text: string, viaFallback: boolean) => Promise<void>
+): void {
+  const providerRunner = (() => {
+    if (branch.provider === "smallest-pulse") {
+      if (!pulseProvider) {
+        throw new Error("Smallest Pulse provider unavailable.");
+      }
+      return pulseProvider.transcribe({
+        streamId: branch.streamId,
+        sessionId: session.id,
+        signal: branch.abortController.signal,
+        audio: branch.audioQueue,
+        language: normalizePulseSttLanguage(payload.language),
+        encoding: STT_ENCODING,
+        sampleRate: STT_SAMPLE_RATE,
+        wordTimestamps: false,
+        fullTranscript: true,
+        timeoutMs: config.sttStreamTimeoutMs
+      });
+    }
+
+    if (!openAiRealtimeProvider) {
+      throw new Error("OpenAI Realtime STT provider unavailable.");
+    }
+
+    return openAiRealtimeProvider.transcribe({
+      streamId: branch.streamId,
+      sessionId: session.id,
+      signal: branch.abortController.signal,
+      audio: branch.audioQueue,
+      language: normalizeOpenAiSttLanguage(payload.language),
+      encoding: STT_ENCODING,
+      sampleRate: STT_SAMPLE_RATE,
+      timeoutMs: config.sttStreamTimeoutMs,
+      model: config.openaiRealtimeSttModel
+    });
+  })();
+
+  void (async () => {
+    try {
+      for await (const event of providerRunner) {
+        if (!sessions.has(session.ws)) {
+          branch.abortController.abort();
+          branch.audioQueue.close();
+          return;
+        }
+
+        if (session.activeStt?.streamId !== active.streamId) {
+          branch.abortController.abort();
+          branch.audioQueue.close();
+          return;
+        }
+
+        if (event.type === "start") {
+          if (branch.openedAtMs === null) {
+            branch.openedAtMs = performance.now();
+          }
+          continue;
+        }
+
+        if (event.type === "debug") {
+          if (branch.debugSamples.length < 5) {
+            branch.debugSamples.push({
+              kind: event.kind,
+              keys: event.keys,
+              sample: event.sample
+            });
+          }
+          continue;
+        }
+
+        if (event.type === "transcript") {
+          if (active.finalTranscriptAtMs !== null) {
+            continue;
+          }
+
+          clearSttNoTranscriptTimer(active);
+          const now = performance.now();
+          active.anyTranscriptSeen = true;
+          if (active.firstTranscriptAtMs === null) {
+            active.firstTranscriptAtMs = now;
+            metrics.onFirstTranscript(active.streamId, Math.max(0, Math.round(now - active.startedAtMs)));
+          }
+          if (branch.firstTranscriptAtMs === null) {
+            branch.firstTranscriptAtMs = now;
+            metrics.onFirstTranscript(branch.streamId, Math.max(0, Math.round(now - active.startedAtMs)));
+          }
+
+          branch.lastTranscriptText = event.text;
+          branch.lastTranscriptAtMs = now;
+
+          if (event.isFinal) {
+            branch.finalTranscriptAtMs = now;
+            await commitFinalTranscript(branch.provider, event.text, false);
+            continue;
+          }
+
+          branch.partialCount += 1;
+          if (branch.lastPartialAtMs !== null) {
+            branch.partialIntervalsMs.push(Math.max(0, now - branch.lastPartialAtMs));
+          }
+          branch.lastPartialAtMs = now;
+
+          if (branch.provider === active.primaryProvider) {
+            active.partialCount += 1;
+            if (active.lastPartialAtMs !== null) {
+              active.partialIntervalsMs.push(Math.max(0, now - active.lastPartialAtMs));
+            }
+            active.lastPartialAtMs = now;
+
+            send(session.ws, {
+              type: "transcript.partial",
+              payload: {
+                text: event.text,
+                from: "user",
+                utteranceId: active.utteranceId,
+                provider: branch.provider
+              }
+            });
+
+            // If audio.start arrives slightly late, still hard-interrupt any in-flight TTS.
+            interruptActiveStream(session);
+          }
+
+          if (active.audioEndedAtMs !== null) {
+            armSttFinalizeFallbackTimer(session, active, branch, commitFinalTranscript);
+          }
+          continue;
+        }
+
+        if (event.type === "end") {
+          branch.endedReason = event.reason === "error" ? "error" : event.reason;
+          if (active.finalTranscriptAtMs === null && active.audioEndedAtMs !== null) {
+            const candidate = (branch.lastTranscriptText ?? "").trim();
+            if (candidate) {
+              branch.finalizedViaFallback = true;
+              await commitFinalTranscript(branch.provider, candidate, true);
+              return;
+            }
+          }
+
+          if (active.finalTranscriptAtMs === null && allSttBranchesSettled(active)) {
+            emitSttFailure(session, active);
+            maybeFinalizeSttUtterance(session, active, "error");
+            return;
+          }
+
+          if (active.finalTranscriptAtMs !== null) {
+            maybeFinalizeSttUtterance(session, active, "completed");
+            return;
+          }
+        }
+      }
+    } catch (error) {
+      if (branch.abortController.signal.aborted || session.activeStt?.streamId !== active.streamId) {
+        return;
+      }
+
+      const normalized = (() => {
+        if (isPulseProviderError(error)) {
+          return {
+            code: error.code,
+            retryable: error.retryable,
+            message: error.message
+          };
+        }
+        if (isOpenAiRealtimeProviderError(error)) {
+          return {
+            code: error.code,
+            retryable: error.retryable,
+            message: error.message
+          };
+        }
+        if (error instanceof Error) {
+          return {
+            code: "unknown_error",
+            retryable: false,
+            message: error.message
+          };
+        }
+        return {
+          code: "unknown_error",
+          retryable: false,
+          message: String(error)
+        };
+      })();
+
+      branch.errorCode = normalized.code;
+      branch.errorMessage = normalized.message;
+      branch.retryableError = normalized.retryable;
+      branch.endedReason = "error";
+
+      log.warn("stt_provider_failed", {
+        sessionId: session.id,
+        utteranceId: active.utteranceId,
+        provider: branch.provider,
+        code: normalized.code,
+        retryable: normalized.retryable,
+        error: normalized.message
+      });
+
+      if (active.finalTranscriptAtMs !== null) {
+        maybeFinalizeSttUtterance(session, active, "completed");
+        return;
+      }
+
+      if (allSttBranchesSettled(active)) {
+        emitSttFailure(session, active);
+        maybeFinalizeSttUtterance(session, active, "error");
+      }
+    } finally {
+      branch.audioQueue.close();
+      clearSttFinalizeFallbackTimer(branch);
+      if (session.activeStt?.streamId === active.streamId) {
+        finalizeSttBranchMetrics(active, branch, hasSttFinal(active) ? "completed" : "error");
+      }
+    }
+  })();
+}
+
 function startSmallestSttStream(
   session: SessionContext,
   payload: { encoding?: string; sampleRate?: number; language?: string }
 ): void {
-  if (!pulseProvider) {
+  const availableProviders: SttProviderName[] = [];
+  if (pulseProvider) {
+    availableProviders.push("smallest-pulse");
+  }
+  if (openAiRealtimeProvider) {
+    availableProviders.push("openai-realtime");
+  }
+
+  if (availableProviders.length === 0) {
     send(session.ws, {
       type: "error",
       payload: {
         code: "STT_NOT_CONFIGURED",
-        message: "Server STT is not configured. Enable SMALLEST_API_KEY or use browser SpeechRecognition.",
+        message: "Server STT is not configured. Enable SMALLEST_API_KEY or OPENAI_API_KEY, or use browser SpeechRecognition.",
         retryable: false
       }
     });
@@ -1641,200 +2467,189 @@ function startSmallestSttStream(
   interruptActiveStream(session);
   interruptActiveSttStream(session);
 
-  const streamId = randomUUID();
-  const abortController = new AbortController();
-  const audioQueue = createPushableAsyncIterable<Buffer>();
+  const providerOrder = resolveSttProviderOrder(availableProviders);
+  const selectedProviders = config.sttParallelEnabled ? providerOrder.slice(0, 2) : providerOrder.slice(0, 1);
+  const utteranceId = randomUUID();
+  const now = performance.now();
 
-  const active: ActiveSttStream = {
-    abortController,
-    streamId,
-    provider: pulseProvider.name,
-    startedAtMs: performance.now(),
-    audioEndedAtMs: null,
+  const branches: SttProviderBranch[] = selectedProviders.map((provider) => ({
+    provider,
+    streamId: `${utteranceId}:${provider}`,
+    abortController: new AbortController(),
+    audioQueue: createPushableAsyncIterable<Buffer>(),
+    startedAtMs: now,
+    openedAtMs: null,
+    debugSamples: [],
     firstTranscriptAtMs: null,
     lastPartialAtMs: null,
     partialIntervalsMs: [],
     partialCount: 0,
     finalTranscriptAtMs: null,
+    finalizedViaFallback: false,
+    lastTranscriptText: null,
+    lastTranscriptAtMs: null,
+    finalizeFallbackTimer: null,
+    endedReason: null,
+    errorCode: null,
+    errorMessage: null,
+    retryableError: null,
+    metricsFinalized: false
+  }));
+
+  const active: ActiveSttStream = {
+    utteranceId,
+    streamId: utteranceId,
+    provider: selectedProviders.length > 1 ? "parallel" : selectedProviders[0],
+    providerOrder: selectedProviders,
+    primaryProvider: selectedProviders[0],
+    branches,
+    startedAtMs: now,
+    audioEndedAtMs: null,
+    audioBytesReceived: 0,
+    audioChunksReceived: 0,
+    firstAudioAtMs: null,
+    lastAudioAtMs: null,
+    firstAudioRms: null,
+    maxAudioRms: null,
+    audioRmsSum: 0,
+    audioRmsCount: 0,
+    firstTranscriptAtMs: null,
+    anyTranscriptSeen: false,
+    lastPartialAtMs: null,
+    partialIntervalsMs: [],
+    partialCount: 0,
+    finalTranscriptAtMs: null,
+    winnerProvider: null,
+    winnerFinalText: null,
+    finalizedViaFallback: false,
     metricsFinalized: false,
-    audioQueue,
     noTranscriptTimer: null,
     noSpeechSent: false
   };
 
   session.activeStt = active;
-  metrics.onSttStreamStart(streamId, session.id, active.provider);
+  metrics.onSttStreamStart(active.streamId, session.id, active.provider);
+  for (const branch of branches) {
+    metrics.onSttStreamStart(branch.streamId, session.id, branch.provider);
+  }
 
-  void (async () => {
+  const commitFinalTranscript = async (
+    provider: SttProviderName,
+    text: string,
+    viaFallback: boolean
+  ): Promise<void> => {
+    if (!sessions.has(session.ws)) {
+      return;
+    }
+
+    if (session.activeStt?.streamId !== active.streamId) {
+      return;
+    }
+
+    const normalized = text.trim();
+    if (!normalized || active.finalTranscriptAtMs !== null) {
+      return;
+    }
+
+    const winnerBranch = getSttBranch(active, provider);
+    if (!winnerBranch) {
+      return;
+    }
+
+    active.finalTranscriptAtMs = performance.now();
+    active.winnerProvider = provider;
+    active.winnerFinalText = normalized;
+    active.finalizedViaFallback = viaFallback;
+
+    winnerBranch.finalTranscriptAtMs = winnerBranch.finalTranscriptAtMs ?? active.finalTranscriptAtMs;
+    winnerBranch.finalizedViaFallback = viaFallback;
+    winnerBranch.endedReason = winnerBranch.endedReason ?? "complete";
+    winnerBranch.audioQueue.close();
+    winnerBranch.abortController.abort();
+
+    for (const branch of active.branches) {
+      clearSttFinalizeFallbackTimer(branch);
+      if (branch.provider === provider) {
+        continue;
+      }
+      branch.endedReason = branch.endedReason ?? "stopped";
+      branch.audioQueue.close();
+      branch.abortController.abort();
+    }
+
+    maybeFinalizeSttUtterance(session, active, "completed");
+
     try {
-      for await (const event of pulseProvider.transcribe({
-        streamId,
-        sessionId: session.id,
-        signal: abortController.signal,
-        audio: audioQueue,
-        language: normalizeSttLanguage(payload.language),
-        encoding: STT_ENCODING,
-        sampleRate: STT_SAMPLE_RATE,
-        wordTimestamps: true,
-        fullTranscript: true,
-        timeoutMs: config.sttStreamTimeoutMs
-      })) {
-        if (!sessions.has(session.ws)) {
-          abortController.abort();
-          audioQueue.close();
-          return;
-        }
-
-        if (session.activeStt?.streamId !== streamId) {
-          abortController.abort();
-          audioQueue.close();
-          return;
-        }
-
-        if (event.type === "start") {
-          continue;
-        }
-
-        if (event.type === "transcript") {
-          clearSttNoTranscriptTimer(active);
-          const now = performance.now();
-          if (active.firstTranscriptAtMs === null) {
-            active.firstTranscriptAtMs = now;
-            metrics.onFirstTranscript(streamId, Math.max(0, Math.round(now - active.startedAtMs)));
-          }
-
-          if (event.isFinal) {
-            if (active.finalTranscriptAtMs !== null) {
-              continue;
-            }
-
-            active.finalTranscriptAtMs = now;
-            const normalized = event.text.trim();
-            if (normalized) {
-              await handleFinalUserText(session, normalized);
-            }
-            continue;
-          }
-
-          active.partialCount += 1;
-          if (active.lastPartialAtMs !== null) {
-            active.partialIntervalsMs.push(Math.max(0, now - active.lastPartialAtMs));
-          }
-          active.lastPartialAtMs = now;
-
-          send(session.ws, {
-            type: "transcript.partial",
-            payload: {
-              text: event.text,
-              from: "user"
-            }
-          });
-
-          // If audio.start arrives slightly late, still hard-interrupt any in-flight TTS.
-          interruptActiveStream(session);
-          continue;
-        }
-
-        if (event.type === "end") {
-          const status = event.reason === "complete" ? "completed" : event.reason;
-          finalizeActiveSttStream(session, active, status);
-
-          const hadTranscript =
-            active.firstTranscriptAtMs !== null || active.partialCount > 0 || active.finalTranscriptAtMs !== null;
-          if (!hadTranscript && active.audioEndedAtMs !== null && !active.noSpeechSent) {
-            active.noSpeechSent = true;
-            send(session.ws, {
-              type: "error",
-              payload: {
-                code: "STT_NO_SPEECH",
-                message: "No speech detected. Try again.",
-                retryable: true
-              }
-            });
-          }
-
-          if (session.activeStt?.streamId === streamId) {
-            session.activeStt = undefined;
-          }
-
-          return;
-        }
-      }
-    } catch (error) {
-      if (abortController.signal.aborted) {
-        return;
-      }
-
-      clearSttNoTranscriptTimer(active);
-
-      const normalized = (() => {
-        if (isPulseProviderError(error)) {
-          return {
-            code: error.code,
-            retryable: error.retryable,
-            message: error.message,
-            provider: error.provider || pulseProvider.name
-          };
-        }
-
-        if (error instanceof Error) {
-          return {
-            code: "unknown_error",
-            retryable: false,
-            message: error.message,
-            provider: pulseProvider.name
-          };
-        }
-
-        return {
-          code: "unknown_error",
-          retryable: false,
-          message: String(error),
-          provider: pulseProvider.name
-        };
-      })();
-
-      const hadTranscript = active.firstTranscriptAtMs !== null || active.partialCount > 0 || active.finalTranscriptAtMs !== null;
-      const noSpeech = !hadTranscript && normalized.code === "stream_timeout";
-
-      log.warn("stt_stream_failed", {
-        sessionId: session.id,
-        streamId,
-        provider: pulseProvider.name,
-        code: normalized.code,
-        retryable: normalized.retryable,
-        error: normalized.message
+      await handleFinalUserText(session, normalized, {
+        utteranceId: active.utteranceId,
+        provider
       });
-
-      if (noSpeech) {
-        active.noSpeechSent = true;
-      }
-      finalizeActiveSttStream(session, active, noSpeech ? "stopped" : "error");
-      if (session.activeStt?.streamId === streamId) {
-        session.activeStt = undefined;
-      }
-
+    } catch (error) {
+      log.error("stt_commit_handle_final_failed", {
+        sessionId: session.id,
+        utteranceId: active.utteranceId,
+        provider,
+        error: error instanceof Error ? error.message : String(error)
+      });
       send(session.ws, {
         type: "error",
         payload: {
-          code: noSpeech ? "STT_NO_SPEECH" : "STT_STREAM_FAILED",
-          message: noSpeech ? "No speech detected. Try again." : "Speech recognition failed. Try again.",
-          retryable: noSpeech ? true : normalized.retryable
+          code: "INTERNAL_ERROR",
+          message: "I couldn't process that transcript. Please try again.",
+          retryable: true
         }
       });
-    } finally {
-      audioQueue.close();
     }
-  })();
+  };
+
+  log.debug("stt_stream_started", {
+    sessionId: session.id,
+    streamId: active.streamId,
+    utteranceId: active.utteranceId,
+    provider: active.provider,
+    providerOrder: selectedProviders,
+    encoding,
+    sampleRate,
+    language: payload.language ?? null
+  });
+
+  for (const branch of branches) {
+    runSttBranch(session, active, branch, payload, commitFinalTranscript);
+  }
 }
 
 function pushSmallestSttAudio(session: SessionContext, chunk: Buffer): void {
   const active = session.activeStt;
-  if (!active || active.audioQueue.closed) {
+  if (!active) {
     return;
   }
 
-  active.audioQueue.push(chunk);
+  const now = performance.now();
+  active.audioBytesReceived += chunk.byteLength;
+  active.audioChunksReceived += 1;
+  const rms = rmsPcm16(chunk);
+  if (rms !== null) {
+    active.maxAudioRms = active.maxAudioRms === null ? rms : Math.max(active.maxAudioRms, rms);
+    active.audioRmsSum += rms;
+    active.audioRmsCount += 1;
+  }
+  if (active.firstAudioAtMs === null) {
+    active.firstAudioAtMs = now;
+    active.firstAudioRms = rms;
+    log.debug("stt_audio_first_chunk", {
+      sessionId: session.id,
+      streamId: active.streamId,
+      bytes: chunk.byteLength,
+      rms: active.firstAudioRms
+    });
+  }
+  active.lastAudioAtMs = now;
+
+  for (const branch of active.branches) {
+    if (!branch.audioQueue.closed) {
+      branch.audioQueue.push(chunk);
+    }
+  }
 }
 
 function endSmallestSttAudio(session: SessionContext): void {
@@ -1847,13 +2662,80 @@ function endSmallestSttAudio(session: SessionContext): void {
     active.audioEndedAtMs = performance.now();
   }
 
-  active.audioQueue.close();
+  for (const branch of active.branches) {
+    branch.audioQueue.close();
+  }
 
   // If the upstream STT provider never responds (common when no speech was detected),
   // bail out quickly so the UI doesn't get stuck in "Processing speech...".
   clearSttNoTranscriptTimer(active);
-  const hadTranscript = active.firstTranscriptAtMs !== null || active.partialCount > 0 || active.finalTranscriptAtMs !== null;
-  if (hadTranscript || active.noSpeechSent) {
+  const current = session.activeStt;
+  if (current && current.streamId === active.streamId) {
+    for (const branch of active.branches) {
+      armSttFinalizeFallbackTimer(session, active, branch, async (provider, text, viaFallback) => {
+        if (session.activeStt?.streamId !== active.streamId || active.finalTranscriptAtMs !== null) {
+          return;
+        }
+        const normalized = text.trim();
+        if (!normalized) {
+          return;
+        }
+        active.finalTranscriptAtMs = performance.now();
+        active.winnerProvider = provider;
+        active.winnerFinalText = normalized;
+        active.finalizedViaFallback = viaFallback;
+        for (const item of active.branches) {
+          clearSttFinalizeFallbackTimer(item);
+          if (item.provider === provider) {
+            item.finalTranscriptAtMs = item.finalTranscriptAtMs ?? active.finalTranscriptAtMs;
+            item.finalizedViaFallback = viaFallback;
+            item.endedReason = item.endedReason ?? "complete";
+          } else {
+            item.endedReason = item.endedReason ?? "stopped";
+          }
+          item.audioQueue.close();
+          item.abortController.abort();
+        }
+        maybeFinalizeSttUtterance(session, active, "completed");
+        try {
+          await handleFinalUserText(session, normalized, {
+            utteranceId: active.utteranceId,
+            provider
+          });
+        } catch (error) {
+          log.error("stt_finalize_fallback_handle_final_failed", {
+            sessionId: session.id,
+            utteranceId: active.utteranceId,
+            provider,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          send(session.ws, {
+            type: "error",
+            payload: {
+              code: "INTERNAL_ERROR",
+              message: "I couldn't process that transcript. Please try again.",
+              retryable: true
+            }
+          });
+        }
+      });
+    }
+  }
+
+  if (active.audioBytesReceived === 0 && !active.noSpeechSent) {
+    active.noSpeechSent = true;
+    interruptActiveSttStream(session, "stopped");
+    send(session.ws, {
+      type: "error",
+      payload: {
+        code: "STT_NO_AUDIO",
+        message: "No audio frames received by server. (WS binary blocked or mic pipeline failed.)",
+        retryable: true
+      }
+    });
+    return;
+  }
+  if (active.finalTranscriptAtMs !== null || active.noSpeechSent) {
     return;
   }
 
@@ -1867,23 +2749,18 @@ function endSmallestSttAudio(session: SessionContext): void {
       return;
     }
 
-    const sawTranscript =
-      current.firstTranscriptAtMs !== null || current.partialCount > 0 || current.finalTranscriptAtMs !== null;
-    if (sawTranscript || current.noSpeechSent) {
+    if (current.finalTranscriptAtMs !== null || current.noSpeechSent) {
       return;
     }
 
-    current.noSpeechSent = true;
-    interruptActiveSttStream(session, "stopped");
-    send(session.ws, {
-      type: "error",
-      payload: {
-        code: "STT_NO_SPEECH",
-        message: "No speech detected. Try again.",
-        retryable: true
-      }
-    });
-  }, STT_NO_TRANSCRIPT_GRACE_MS);
+    emitSttFailure(session, current);
+    interruptActiveSttStream(session, "error");
+  }, (() => {
+    const rms = active.maxAudioRms ?? active.firstAudioRms;
+    const quiet = rms !== null && rms < STT_QUIET_RMS_THRESHOLD;
+    return quiet ? STT_NO_TRANSCRIPT_GRACE_MS_QUIET : STT_NO_TRANSCRIPT_GRACE_MS_SPEECH;
+  })());
+  active.noTranscriptTimer.unref?.();
 }
 
 function contextHint(chunks: RagRetrievedChunk[]): string | null {
@@ -1892,7 +2769,7 @@ function contextHint(chunks: RagRetrievedChunk[]): string | null {
   }
 
   const transcriptChunk = chunks[0];
-  const transcriptExcerpt = transcriptChunk.content.replace(/\s+/g, " ").trim().slice(0, 220);
+  const transcriptExcerpt = truncateForUi(transcriptChunk.content, 220);
   const transcriptCitation = transcriptChunk.sourceRef ? ` (${transcriptChunk.sourceRef})` : "";
   const manualChunk = chunks[1];
 
@@ -1900,14 +2777,40 @@ function contextHint(chunks: RagRetrievedChunk[]): string | null {
     return `Grounded context${transcriptCitation}: ${transcriptExcerpt}`;
   }
 
-  const manualExcerpt = manualChunk.content.replace(/\s+/g, " ").trim().slice(0, 180);
+  const manualExcerpt = truncateForUi(manualChunk.content, 180);
   const manualCitation = manualChunk.sourceRef ? ` (${manualChunk.sourceRef})` : "";
 
   return `Grounded context${transcriptCitation}: ${transcriptExcerpt} Manual citation${manualCitation}: ${manualExcerpt}`;
 }
 
+function truncateForUi(content: string, maxLength: number): string {
+  const cleaned = content.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) {
+    return cleaned;
+  }
+
+  const sliceLength = Math.max(0, maxLength - 1);
+  const slice = cleaned.slice(0, sliceLength);
+  const lastSpace = slice.lastIndexOf(" ");
+  const cutoff = lastSpace >= Math.floor(sliceLength * 0.6) ? slice.slice(0, lastSpace) : slice;
+  return `${cutoff.trimEnd()}…`;
+}
+
 function formatChunkExcerpt(content: string, maxLength: number): string {
-  return content.replace(/\s+/g, " ").trim().slice(0, maxLength);
+  return truncateForUi(content, maxLength);
+}
+
+function normalizeAllCapsPhrases(text: string): string {
+  return text.replace(/\b(?:[A-Z0-9][A-Z0-9'’]*)(?:[\s\-/:;(),]+(?:[A-Z0-9][A-Z0-9'’]*)){1,}\b/g, (phrase) => {
+    const letterCount = (phrase.match(/[A-Za-z]/g) ?? []).length;
+    if (letterCount < 4) {
+      return phrase;
+    }
+    if (/[a-z]/.test(phrase)) {
+      return phrase;
+    }
+    return phrase.toLowerCase();
+  });
 }
 
 function hasStrongGrounding(question: string, chunks: RagRetrievedChunk[]): boolean {
@@ -1998,6 +2901,8 @@ function buildYoutubeContextChunks(session: SessionContext): RagRetrievedChunk[]
 	): { result: EngineResult; source: AssistantMessageSource } {
 	  const normalized = normalizeUtterance(text);
 	  const state = session.engine.getState();
+	  const directHowQuestion = isDirectHowQuestion(normalized);
+	  const explainCurrentStepIntent = isExplainCurrentStepIntent(normalized);
 
 	  const intent = parseStepIntent(normalized, state.currentStepIndex + 1);
 	  if (intent) {
@@ -2056,6 +2961,25 @@ function buildYoutubeContextChunks(session: SessionContext): RagRetrievedChunk[]
 	    }
 	  }
 
+    if (state.status === "awaiting_confirmation") {
+      const yesNo = parseYesNo(normalized);
+      if (yesNo === "yes" || DONE_PATTERN.test(normalized) || AMBIGUOUS_ADVANCE_UTTERANCES.has(normalized)) {
+        return { source: procedureAssistantSource(session), result: session.engine.handleCommand("confirm") };
+      }
+
+      if (yesNo === "no") {
+        return {
+          source: procedureAssistantSource(session),
+          result: {
+            text: "Ok. Say repeat or explain.",
+            speechText: "Ok. Say repeat or explain.",
+            state,
+            shouldSpeak: true
+          }
+        };
+      }
+    }
+
 	  if (AMBIGUOUS_ADVANCE_UTTERANCES.has(normalized)) {
 	    if (state.status === "paused") {
 	      return {
@@ -2085,16 +3009,21 @@ function buildYoutubeContextChunks(session: SessionContext): RagRetrievedChunk[]
 	  const parsed = parseVoiceCommand(text);
 	
 	  if (parsed) {
-	    return { source: procedureAssistantSource(session), result: session.engine.handleCommand(parsed) };
+	    if (parsed === "explain") {
+	      if (shouldUseExplainCommand(normalized)) {
+	        return { source: procedureAssistantSource(session), result: session.engine.handleCommand(parsed) };
+	      }
+	    } else if (!directHowQuestion) {
+	      return { source: procedureAssistantSource(session), result: session.engine.handleCommand(parsed) };
+	    }
 	  }
 	
 	  const mentionSafety = /\b(safe|safety|danger|risk)\b/i.test(text);
-	  if (mentionSafety) {
+	  if (mentionSafety && !directHowQuestion) {
 	    return { source: procedureAssistantSource(session), result: session.engine.handleCommand("safety_check") };
 	  }
 	
-	  const wantsExplain = /\b(why|how|explain|details)\b/i.test(text);
-	  if (wantsExplain) {
+	  if (explainCurrentStepIntent) {
 	    return { source: procedureAssistantSource(session), result: session.engine.handleCommand("explain") };
 	  }
 	
@@ -2187,6 +3116,25 @@ function buildYoutubeContextChunks(session: SessionContext): RagRetrievedChunk[]
 	      return { source: procedureAssistantSource(session), result: moved };
 	    }
 	  }
+
+    if (state.status === "awaiting_confirmation") {
+      const yesNo = parseYesNo(normalized);
+      if (yesNo === "yes" || DONE_PATTERN.test(normalized) || AMBIGUOUS_ADVANCE_UTTERANCES.has(normalized)) {
+        return { source: procedureAssistantSource(session), result: session.engine.handleCommand("confirm") };
+      }
+
+      if (yesNo === "no") {
+        return {
+          source: procedureAssistantSource(session),
+          result: {
+            text: "Ok. Say repeat or explain.",
+            speechText: "Ok. Say repeat or explain.",
+            state,
+            shouldSpeak: true
+          }
+        };
+      }
+    }
 
 	  if (AMBIGUOUS_ADVANCE_UTTERANCES.has(normalized)) {
 	    if (state.status === "paused") {
@@ -2305,20 +3253,34 @@ async function processCommand(session: SessionContext, command: VoiceCommand): P
   }
 
   const result = session.engine.handleCommand(command);
-  applyEngineResult(session, result, undefined, undefined, procedureAssistantSource(session));
+  applyEngineResult(
+    session,
+    result,
+    undefined,
+    undefined,
+    procedureAssistantSource(session),
+    command === "repeat" ? { force: true } : undefined
+  );
 }
 
-async function handleFinalUserText(session: SessionContext, normalized: string): Promise<void> {
+async function handleFinalUserText(
+  session: SessionContext,
+  normalized: string,
+  sttMeta?: { utteranceId?: string; provider?: string }
+): Promise<void> {
   if (!normalized) {
     return;
   }
 
   touchUserActivity(session);
+  const forceAssistantTurn = parseVoiceCommand(normalized) === "repeat";
   send(session.ws, {
     type: "transcript.final",
     payload: {
       text: normalized,
-      from: "user"
+      from: "user",
+      utteranceId: sttMeta?.utteranceId,
+      provider: sttMeta?.provider
     }
   });
 
@@ -2341,7 +3303,8 @@ async function handleFinalUserText(session: SessionContext, normalized: string):
 	          }
 	        : undefined,
 	      normalized,
-	      interpreted.source
+	      interpreted.source,
+	      forceAssistantTurn ? { force: true } : undefined
 	    );
 	    return;
 	  }
@@ -2356,7 +3319,7 @@ async function handleFinalUserText(session: SessionContext, normalized: string):
   }
 
 	  const interpreted = interpretManualUserText(session, normalized, ragResult);
-	  applyEngineResult(session, interpreted.result, ragResult, normalized, interpreted.source);
+	  applyEngineResult(session, interpreted.result, ragResult, normalized, interpreted.source, forceAssistantTurn ? { force: true } : undefined);
 	}
 
 function cleanupSession(ws: WebSocket): void {
@@ -2532,6 +3495,10 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
 	        onboardingLastSource: "general",
 	        onboardingLastRagContext: null,
 	        onboardingLastRagQuery: null,
+	        lastPromptHash: null,
+	        lastPromptAtMs: null,
+	        lastAssistantTurnHash: null,
+	        lastAssistantTurnAtMs: null,
 	        youtubeStepExplainMap: compiled.stepExplainMap,
 	        youtubeStepContextMap: compiled.stepContextMap,
 	        youtubeSourceRef: compiled.video.normalizedUrl ?? compiled.video.url,
@@ -2553,7 +3520,7 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
           demoMode: newSession.demoMode || primaryProvider === demoProvider,
           voice: {
             ttsProvider: primaryProvider.name,
-            sttProvider: pulseProvider ? "smallest-pulse" : "browser-speech"
+            sttProvider: configuredServerSttProvider()
           },
           procedureTitle: compiled.engineProcedure.title,
           manualTitle: compiled.video.title
@@ -2601,7 +3568,7 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
         youtubeExtractionSource: compiled.extractionSource,
         youtubeCacheHit: compiled.cacheHit,
         provider: primaryProvider.name,
-        sttProvider: pulseProvider ? pulseProvider.name : "browser-speech"
+        sttProvider: configuredServerSttProvider()
       });
 
       return;
@@ -2718,6 +3685,10 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
 	      onboardingLastSource: "general",
 	      onboardingLastRagContext: null,
 	      onboardingLastRagQuery: null,
+	      lastPromptHash: null,
+	      lastPromptAtMs: null,
+	      lastAssistantTurnHash: null,
+	      lastAssistantTurnAtMs: null,
 	      youtubeStepExplainMap: null,
 	      youtubeStepContextMap: null,
 	      youtubeSourceRef: null,
@@ -2739,7 +3710,7 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
 	        demoMode: newSession.demoMode || primaryProvider === demoProvider,
 	        voice: {
 	          ttsProvider: primaryProvider.name,
-	          sttProvider: pulseProvider ? "smallest-pulse" : "browser-speech"
+	          sttProvider: configuredServerSttProvider()
 	        },
 	        procedureTitle: retrieval.procedure.title,
 	        manualTitle: sessionManualTitle
@@ -2792,7 +3763,7 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
 	      ragFilterModel: ragFilters.modelFilter ?? null,
 	      ragFilterDocumentId: ragFilters.documentIdFilter ?? null,
 	      provider: primaryProvider.name,
-	      sttProvider: pulseProvider ? pulseProvider.name : "browser-speech"
+	      sttProvider: configuredServerSttProvider()
 	    });
 	
 	    return;
@@ -2822,6 +3793,12 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
 
   if (parsed.type === "audio.start") {
     touchUserActivity(session);
+    log.debug("stt_audio_start", {
+      sessionId: session.id,
+      encoding: parsed.payload.encoding,
+      sampleRate: parsed.payload.sampleRate,
+      language: parsed.payload.language ?? null
+    });
     startSmallestSttStream(session, parsed.payload);
     return;
   }
@@ -2843,6 +3820,20 @@ async function handleMessage(ws: WebSocket, raw: unknown): Promise<void> {
 
   if (parsed.type === "audio.end") {
     touchUserActivity(session);
+    const active = session.activeStt;
+	  log.debug("stt_audio_end", {
+	    sessionId: session.id,
+	    streamId: active?.streamId ?? null,
+	    bytesReceived: active?.audioBytesReceived ?? 0,
+	    chunksReceived: active?.audioChunksReceived ?? 0,
+	    firstAudioRms: active?.firstAudioRms ?? null,
+	    maxAudioRms: active?.maxAudioRms ?? null,
+	    avgAudioRms:
+	      active && active.audioRmsCount > 0
+	        ? Math.round((active.audioRmsSum / active.audioRmsCount) * 100000) / 100000
+	        : null,
+	    reason: parsed.payload?.reason ?? null
+	  });
     endSmallestSttAudio(session);
     return;
   }
@@ -2883,7 +3874,26 @@ async function main(): Promise<void> {
 
   const server = http.createServer((req, res) => {
     void (async () => {
-      res.setHeader("Access-Control-Allow-Origin", config.webOrigin);
+      const requestOrigin = req.headers.origin;
+      const allowOrigin = (() => {
+        if (process.env.NODE_ENV === "production" || typeof requestOrigin !== "string" || !requestOrigin.trim()) {
+          return config.webOrigin;
+        }
+
+        try {
+          const parsed = new URL(requestOrigin);
+          if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") {
+            return requestOrigin;
+          }
+        } catch {
+          // ignore
+        }
+
+        return config.webOrigin;
+      })();
+
+      res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+      res.setHeader("Vary", "Origin");
       res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
@@ -3152,7 +4162,8 @@ async function main(): Promise<void> {
       manualsDir: config.manualsDir,
       demoMode: config.demoMode,
       primaryProvider: primaryProvider.name,
-      fallbackProvider: fallbackProvider?.name ?? null
+      fallbackProvider: fallbackProvider?.name ?? null,
+      sttProvider: configuredServerSttProvider()
     });
   });
 }

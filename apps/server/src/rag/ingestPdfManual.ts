@@ -409,29 +409,6 @@ function inferModel(filenameStem: string, firstPageText: string): string | null 
   return null;
 }
 
-function isLowQualityTitle(title: string, filenameStem: string): boolean {
-  const cleaned = title.trim();
-  if (!cleaned) {
-    return true;
-  }
-  const lowered = cleaned.toLowerCase();
-  if (NOISE_TITLES.has(lowered) || cleaned.length < 4) {
-    return true;
-  }
-  const normalizedTitle = lowered.replace(/[^a-z0-9]/g, "");
-  if (normalizedTitle.length < 4) {
-    return true;
-  }
-  if (cleaned.toLowerCase() === filenameStem.toLowerCase() && /[0-9]/.test(filenameStem)) {
-    return true;
-  }
-  // Titles that are basically model codes are rarely user-friendly.
-  if (MODEL_PATTERNS.some((pattern) => pattern.test(cleaned.toUpperCase())) && cleaned.length <= 32) {
-    return true;
-  }
-  return false;
-}
-
 function inferTitle(metadataTitle: string | null, pages: PageRecord[], filenameStem: string): string {
   if (metadataTitle) {
     return metadataTitle;
@@ -450,7 +427,7 @@ function inferTitle(metadataTitle: string | null, pages: PageRecord[], filenameS
   return filenameStem.replace(/_/g, " ").trim() || filenameStem;
 }
 
-async function inferMetadataWithOpenAiFallback(
+async function inferMetadataWithOpenAi(
   config: AppConfig,
   input: {
     filename: string;
@@ -467,11 +444,10 @@ async function inferMetadataWithOpenAiFallback(
   let brand = inferBrand(joinedContext);
   let model = inferModel(input.filenameStem, firstPageText);
 
-  const shouldUseLlm = !brand || !model || isLowQualityTitle(title, input.filenameStem);
   const apiKey = (process.env.METADATA_API_KEY ?? config.embeddingsApiKey ?? "").trim();
   const modelName = (process.env.METADATA_MODEL ?? "gpt-4o-mini").trim();
 
-  if (!shouldUseLlm || !apiKey) {
+  if (!apiKey) {
     return {
       title: title.slice(0, 160),
       brand,
@@ -659,7 +635,7 @@ export async function ingestPdfManual(input: PdfManualIngestInput): Promise<void
   const extractionStatus = chunkStatus(pages.length, lowTextPages, chunks.length);
 
   const filenameStem = input.sourceFilename.replace(/\.[^.]+$/, "");
-  const metadata = await inferMetadataWithOpenAiFallback(input.config, {
+  const metadata = await inferMetadataWithOpenAi(input.config, {
     filename: input.sourceFilename,
     filenameStem,
     metadataTitle,

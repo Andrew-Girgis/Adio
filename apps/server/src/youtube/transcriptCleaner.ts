@@ -16,6 +16,12 @@ const RANGE_PATTERN =
   /^(\d{1,2}:\d{2}(?::\d{2})?[\.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?[\.,]\d{3})(?:\s+.*)?$/;
 const BRACKET_TIMESTAMP_PATTERN = /^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s+(.+)$/;
 
+const MIN_STRONG_PREFIX_TOKENS = 8;
+const MIN_OVERLAP_TOKENS = 3;
+const MAX_OVERLAP_TOKENS = 18;
+const MAX_MERGE_WINDOW_SEC = 8;
+const MAX_MERGED_CHARS = 420;
+
 interface RawSegmentInput {
   startSec: number | null;
   endSec: number | null;
@@ -30,14 +36,18 @@ export function cleanTranscript(rawText: string): NormalizedTranscript {
 
 export function cleanTranscriptFromSegments(segments: RawSegmentInput[], rawText?: string): NormalizedTranscript {
   const parsed = segments
-    .map((segment, index) => ({
-      index: index + 1,
-      startSec: segment.startSec,
-      endSec: segment.endSec,
-      timestampRange: toTimestampRange(segment.startSec, segment.endSec),
-      text: segment.text,
-      rawText: segment.rawText ?? segment.text
-    }))
+    .map((segment, index) => {
+      const bounds = sanitizeTimestampBounds(segment.startSec, segment.endSec);
+
+      return {
+        index: index + 1,
+        startSec: bounds.startSec,
+        endSec: bounds.endSec,
+        timestampRange: toTimestampRange(bounds.startSec, bounds.endSec),
+        text: segment.text,
+        rawText: segment.rawText ?? segment.text
+      };
+    })
     .filter((segment) => segment.text.trim().length > 0);
 
   const fallbackRawText =
@@ -51,7 +61,8 @@ export function cleanTranscriptFromSegments(segments: RawSegmentInput[], rawText
 }
 
 function normalizeParsedSegments(parsedSegments: TranscriptSegment[], rawText: string): NormalizedTranscript {
-  const merged = mergeBrokenSentences(parsedSegments);
+  const deduped = dedupeProgressiveSegments(parsedSegments);
+  const merged = mergeBrokenSentences(deduped);
   const cleaned = merged
     .map((segment, index) => {
       const cleanedText = cleanSegmentText(segment.text);
@@ -191,11 +202,14 @@ function mergeBrokenSentences(segments: TranscriptSegment[]): TranscriptSegment[
     const previous = merged[merged.length - 1];
 
     if (previous && shouldMerge(previous.text, segment.text) && timestampCompatible(previous, segment)) {
-      previous.text = `${previous.text} ${segment.text}`.replace(/\s+/g, " ").trim();
-      previous.rawText = `${previous.rawText} ${segment.rawText}`.replace(/\s+/g, " ").trim();
-      previous.endSec = segment.endSec ?? previous.endSec;
-      previous.timestampRange = toTimestampRange(previous.startSec, previous.endSec);
-      continue;
+      const nextText = mergeTextWithOverlap(previous.text, segment.text);
+      if (nextText.length <= MAX_MERGED_CHARS) {
+        previous.text = nextText;
+        previous.rawText = mergeTextWithOverlap(previous.rawText, segment.rawText);
+        previous.endSec = segment.endSec ?? previous.endSec;
+        previous.timestampRange = toTimestampRange(previous.startSec, previous.endSec);
+        continue;
+      }
     }
 
     merged.push({ ...segment });
@@ -214,15 +228,30 @@ function shouldMerge(left: string, right: string): boolean {
 
   const leftEndsSentence = /[.!?]$/.test(leftTrim);
   const rightStartsLower = /^[a-z]/.test(rightTrim);
-  return !leftEndsSentence || rightStartsLower;
+  return !leftEndsSentence && rightStartsLower;
 }
 
 function timestampCompatible(a: TranscriptSegment, b: TranscriptSegment): boolean {
-  if (a.startSec === null || b.startSec === null) {
+  const aHasTime = typeof a.startSec === "number" && Number.isFinite(a.startSec);
+  const bHasTime = typeof b.startSec === "number" && Number.isFinite(b.startSec);
+
+  if (!aHasTime && !bHasTime) {
     return true;
   }
 
-  return Math.abs(a.startSec - b.startSec) <= 20;
+  if (aHasTime !== bHasTime) {
+    return false;
+  }
+
+  if (a.startSec === null || b.startSec === null) {
+    return false;
+  }
+
+  if (b.startSec < a.startSec) {
+    return false;
+  }
+
+  return b.startSec - a.startSec <= MAX_MERGE_WINDOW_SEC;
 }
 
 function cleanSegmentText(text: string): string {
@@ -268,8 +297,19 @@ function toTimestampRange(startSec: number | null, endSec: number | null): strin
     return "unknown";
   }
 
-  const left = startSec === null ? "unknown" : formatTimestamp(startSec);
-  const right = endSec === null ? left : formatTimestamp(endSec);
+  if (startSec === null) {
+    return formatTimestamp(endSec as number);
+  }
+
+  if (endSec === null) {
+    return formatTimestamp(startSec);
+  }
+
+  const left = formatTimestamp(startSec);
+  const right = formatTimestamp(endSec);
+  if (left === right) {
+    return left;
+  }
   return `${left}-${right}`;
 }
 
@@ -288,4 +328,169 @@ function formatTimestamp(sec: number): string {
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function sanitizeTimestampBounds(
+  startSec: number | null,
+  endSec: number | null
+): { startSec: number | null; endSec: number | null } {
+  let start = typeof startSec === "number" && Number.isFinite(startSec) ? startSec : null;
+  let end = typeof endSec === "number" && Number.isFinite(endSec) ? endSec : null;
+
+  if (start === null && end !== null) {
+    start = end;
+  } else if (start !== null && end === null) {
+    end = start;
+  }
+
+  if (start !== null && end !== null && end < start) {
+    const tmp = start;
+    start = end;
+    end = tmp;
+  }
+
+  return { startSec: start, endSec: end };
+}
+
+function dedupeProgressiveSegments(segments: TranscriptSegment[]): TranscriptSegment[] {
+  if (segments.length <= 1) {
+    return segments;
+  }
+
+  const out: TranscriptSegment[] = [];
+  let lastFullTokens: string[] = [];
+
+  for (const segment of segments) {
+    const text = segment.text.trim();
+    if (!text) {
+      continue;
+    }
+
+    const rawText = (segment.rawText ?? text).trim();
+    const spans = extractTokenSpans(text);
+    const tokens = spans.map((entry) => entry.token);
+
+    if (lastFullTokens.length >= MIN_STRONG_PREFIX_TOKENS && startsWithTokens(tokens, lastFullTokens)) {
+      const prefixLen = lastFullTokens.length;
+      if (tokens.length === prefixLen) {
+        // Exact duplicate progressive caption update; drop it.
+        lastFullTokens = tokens;
+        continue;
+      }
+
+      const deltaText = sliceFromTokenIndex(text, spans, prefixLen).trim();
+      if (!deltaText) {
+        lastFullTokens = tokens;
+        continue;
+      }
+
+      const rawSpans = extractTokenSpans(rawText);
+      const deltaRaw = (rawSpans.length >= prefixLen ? sliceFromTokenIndex(rawText, rawSpans, prefixLen) : rawText).trim();
+
+      out.push({
+        ...segment,
+        text: deltaText,
+        rawText: deltaRaw || deltaText
+      });
+
+      lastFullTokens = tokens;
+      continue;
+    }
+
+    out.push({
+      ...segment,
+      text,
+      rawText
+    });
+
+    lastFullTokens = tokens;
+  }
+
+  return out;
+}
+
+function mergeTextWithOverlap(prev: string, next: string): string {
+  const left = prev.trim();
+  const right = next.trim();
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+
+  const leftSpans = extractTokenSpans(left);
+  const rightSpans = extractTokenSpans(right);
+  const leftTokens = leftSpans.map((entry) => entry.token);
+  const rightTokens = rightSpans.map((entry) => entry.token);
+
+  if (leftTokens.length >= MIN_STRONG_PREFIX_TOKENS && startsWithTokens(rightTokens, leftTokens)) {
+    return right;
+  }
+
+  const maxK = Math.min(MAX_OVERLAP_TOKENS, leftTokens.length, rightTokens.length);
+  for (let k = maxK; k >= MIN_OVERLAP_TOKENS; k -= 1) {
+    if (tokensEqual(leftTokens.slice(leftTokens.length - k), rightTokens.slice(0, k))) {
+      const sliced = sliceFromTokenIndex(right, rightSpans, k).trim();
+      return [left, sliced].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    }
+  }
+
+  return `${left} ${right}`.replace(/\s+/g, " ").trim();
+}
+
+function extractTokenSpans(text: string): Array<{ token: string; start: number; end: number }> {
+  const spans: Array<{ token: string; start: number; end: number }> = [];
+  const re = /[A-Za-z0-9]+/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = re.exec(text)) !== null) {
+    spans.push({
+      token: match[0].toLowerCase(),
+      start: match.index,
+      end: match.index + match[0].length
+    });
+  }
+
+  return spans;
+}
+
+function startsWithTokens(tokens: string[], prefix: string[]): boolean {
+  if (prefix.length > tokens.length) {
+    return false;
+  }
+
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (tokens[i] !== prefix[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function tokensEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function sliceFromTokenIndex(text: string, spans: Array<{ token: string; start: number; end: number }>, tokenIndex: number): string {
+  if (tokenIndex <= 0) {
+    return text;
+  }
+
+  if (tokenIndex >= spans.length) {
+    return "";
+  }
+
+  return text.slice(spans[tokenIndex].start);
 }
